@@ -1,0 +1,15 @@
+fastapi
+uvicorn
+duckdb
+pandas
+python-multipart
+nicegui
+httpx
+sqlglot
+faker
+sdv
+torch
+networkx
+pyarrow
+python-dotenv
+spacy

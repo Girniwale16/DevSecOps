@@ -1,0 +1,22 @@
+/Users/saurabh.aware/nexus-synth-studio/backend/app/main.py:28: DeprecationWarning: 
+        on_event is deprecated, use lifespan event handlers instead.
+
+        Read more about it in the
+        [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).
+        
+  @app.on_event("startup")
+INFO:     Started server process [5760]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+INFO:     127.0.0.1:50693 - "POST /upload HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50695 - "GET /project/de52b4ed-b6b2-42af-a8d5-bad659432c00 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50695 - "GET /project/de52b4ed-b6b2-42af-a8d5-bad659432c00/plan?base_rows=100 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50709 - "GET /project/de52b4ed-b6b2-42af-a8d5-bad659432c00 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50709 - "GET /project/de52b4ed-b6b2-42af-a8d5-bad659432c00/plan?base_rows=100 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50739 - "POST /project/de52b4ed-b6b2-42af-a8d5-bad659432c00/config/update HTTP/1.1" 422 Unprocessable Entity
+INFO:     127.0.0.1:50757 - "GET /project/de52b4ed-b6b2-42af-a8d5-bad659432c00 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50757 - "GET /project/de52b4ed-b6b2-42af-a8d5-bad659432c00/plan?base_rows=100 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50801 - "GET /generate/de52b4ed-b6b2-42af-a8d5-bad659432c00?num_rows=10000000.0 HTTP/1.1" 405 Method Not Allowed
+INFO:     127.0.0.1:50801 - "GET /favicon.ico HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:51223 - "GET /.well-known/appspecific/com.chrome.devtools.json HTTP/1.1" 404 Not Found

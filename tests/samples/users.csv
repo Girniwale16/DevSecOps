@@ -1,0 +1,11 @@
+id,name,email,age,membership_status
+1,John Doe,john@example.com,28,Gold
+2,Jane Smith,jane@example.com,34,Silver
+3,Bob Johnson,bob@example.com,45,Bronze
+4,Alice Williams,alice@example.com,22,Gold
+5,Charlie Brown,charlie@example.com,31,Silver
+6,David Miller,david@example.com,52,Bronze
+7,Eve Davis,eve@example.com,27,Gold
+8,Frank Wilson,frank@example.com,39,Silver
+9,Grace Taylor,grace@example.com,41,Bronze
+10,Henry Moore,henry@example.com,25,Gold
