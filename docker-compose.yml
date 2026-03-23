@@ -18,8 +18,9 @@ services:
       context: .
       dockerfile: frontend/Dockerfile
     container_name: datacosmos-frontend
+    env_file:
+      - .env
     environment:
-      BACKEND_URL: http://backend:8000
       NICEGUI_HOST: 0.0.0.0
       NICEGUI_PORT: 8181
       NICEGUI_STORAGE_SECRET: nexus-local-dev-secret-change-me
