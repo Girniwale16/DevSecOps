@@ -2071,6 +2071,9 @@ async def download_task_file(task_id: str):
     if task_id not in tasks or tasks[task_id]["status"] != "done":
         raise HTTPException(status_code=404, detail="File not ready or task failed")
     file_path = tasks[task_id]["file_path"]
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found on disk")
+    
     filename = os.path.basename(file_path)
     
     # Determine media type based on file extension
@@ -2083,6 +2086,19 @@ async def download_task_file(task_id: str):
     else:
         media_type = "application/octet-stream"
     
+    # Use StreamingResponse for ZIP files to avoid timeout issues
+    if filename.endswith('.zip'):
+        def iterfile():
+            with open(file_path, "rb") as f:
+                yield from f
+        
+        return StreamingResponse(
+            iterfile(),
+            media_type=media_type,
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+    
+    # FileResponse for CSV and other files
     return FileResponse(
         file_path, 
         filename=filename,
