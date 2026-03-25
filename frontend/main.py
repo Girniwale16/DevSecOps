@@ -33,6 +33,7 @@ STEPS = [
     {"key": "project", "label": "Workspace"},
     {"key": "modeling", "label": "Modeling"},
     {"key": "generate", "label": "Generate"},
+    {"key": "output", "label": "Output"},
 ]
 
 ui.add_head_html(
@@ -343,6 +344,7 @@ async def main_page() -> None:
         "assistant_fullscreen": False,
         "assistant_fresh_start": False,
         "recent_csv_uploads": {},
+        "pending_download_url": None,
     }
     SCHEMA_TYPE_OPTIONS = [
         "varchar",
@@ -386,6 +388,8 @@ async def main_page() -> None:
             return True
         if name == "input":
             return bool(local_state["setup_mode"])
+        if name == "output":
+            return bool(local_state["project_id"]) and bool(local_state.get("sample_confirmed"))
         return bool(local_state["project_id"])
 
     def safe_notify(message: str, notify_type: str = "info") -> None:
@@ -394,17 +398,17 @@ async def main_page() -> None:
         except Exception:
             print(f"[notify:{notify_type}] {message}")
 
-    def download_file(url: str) -> None:
+    def download_file(url: str, *, notify: bool = True) -> bool:
         """Download a file from URL using browser's download mechanism."""
         if not url:
-            safe_notify("Download URL is empty. File may not be ready.", notify_type="warning")
-            return
+            if notify:
+                safe_notify("Download URL is empty. File may not be ready.", notify_type="warning")
+            return False
         
         try:
             print(f"[download] Browser-accessible URL: {url}")
-            
-            # Use direct link navigation (most reliable for downloads)
-            ui.run_javascript(f"""
+
+            js = f"""
                 (async () => {{
                     try {{
                         console.log('Downloading from:', '{url}');
@@ -458,11 +462,35 @@ async def main_page() -> None:
                         alert('Download failed: ' + error.message);
                     }}
                 }})();
-            """)
-            safe_notify("Download started. Check your downloads folder.", notify_type="positive")
+            """
+
+            # If this function is called from a background task, defer to next UI render cycle.
+            if not client_is_active():
+                local_state["pending_download_url"] = url
+                return False
+
+            try:
+                client.run_javascript(js)
+            except Exception:
+                # Fallback for cases where client runner is unavailable
+                ui.run_javascript(js)
+
+            if notify:
+                safe_notify("Download started. Check your downloads folder.", notify_type="positive")
+            return True
         except Exception as ex:
-            safe_notify(f"Download error: {ex}", notify_type="negative")
+            if notify:
+                safe_notify(f"Download error: {ex}", notify_type="negative")
             print(f"[download] Exception: {ex}")
+            return False
+
+    def flush_pending_download() -> None:
+        pending_url = str(local_state.get("pending_download_url") or "").strip()
+        if not pending_url:
+            return
+        # Clear first to avoid duplicate downloads on repeated refreshes.
+        local_state["pending_download_url"] = None
+        download_file(pending_url, notify=False)
 
     def handle_download_click() -> None:
         """Handle download button click with proper error checking."""
@@ -617,8 +645,6 @@ async def main_page() -> None:
         sync_generation_table_settings()
         local_state["generation_table_settings"][table_name]["num_rows"] = rows
         local_state["num_rows"] = rows
-        safe_refresh(generate_view)
-        safe_refresh(assistant_widget)
 
     def set_generation_table_seed(value: Any) -> None:
         table_name = str(local_state.get("selected_generation_table") or "").strip()
@@ -631,8 +657,6 @@ async def main_page() -> None:
         sync_generation_table_settings()
         local_state["generation_table_settings"][table_name]["seed"] = seed
         local_state["seed"] = seed
-        safe_refresh(generate_view)
-        safe_refresh(assistant_widget)
 
     def assistant_current_page() -> str:
         return str(local_state.get("assistant_page") or "upload")
@@ -702,27 +726,34 @@ async def main_page() -> None:
                 return [
                     {
                         "role": "assistant",
-                        "text": "Sample approved! The preview data looks good. You can now generate the full dataset below.",
+                        "text": "Sample approved! Continue to Output to run full dataset generation.",
                     }
                 ]
             elif sample_generated:
                 return [
                     {
                         "role": "assistant",
-                        "text": "Sample generated! Review the 5-row preview in the panel above, then approve it to unlock the full generation.",
+                        "text": "Sample generated and downloaded. Approve it to continue to Output.",
                     }
                 ]
             else:
                 return [
                     {
                         "role": "assistant",
-                        "text": "Generate mode ready. Start by creating a 5-row sample preview to validate the output before full generation.",
+                        "text": "Generate mode ready. Start by generating a 5-row sample download, then approve it.",
                     }
                 ]
+        if page == "output":
+            return [
+                {
+                    "role": "assistant",
+                    "text": "You are in Output. Review settings, launch full generation, and download the final dataset.",
+                }
+            ]
         return [
             {
                 "role": "assistant",
-                "text": "You are in Generate. I can explain this page, refresh the plan, or start generation when the project is ready.",
+                "text": "I can help you continue through the workflow.",
             }
         ]
 
@@ -741,6 +772,8 @@ async def main_page() -> None:
             return "modeling"
         if page == "modeling" and local_state.get("project_id"):
             return "generate"
+        if page == "generate" and bool(local_state.get("sample_confirmed")):
+            return "output"
         return None
 
     def assistant_previous_page() -> Optional[str]:
@@ -753,6 +786,8 @@ async def main_page() -> None:
             return "project"
         if page == "generate":
             return "modeling"
+        if page == "output":
+            return "generate"
         return None
 
     def start_new_assistant_chat() -> None:
@@ -815,8 +850,9 @@ async def main_page() -> None:
 
     def approve_sample_preview() -> None:
         local_state["sample_confirmed"] = True
-        safe_notify("Sample approved. You can generate the full dataset now.", notify_type="positive")
+        safe_notify("Sample approved. Continue to Output to generate the full dataset.", notify_type="positive")
         safe_refresh(generate_view)
+        safe_refresh(output_view)
         safe_refresh(assistant_widget)
 
     def should_show_same_table_analytics() -> bool:
@@ -831,6 +867,29 @@ async def main_page() -> None:
         lowered = text.lower()
         page = assistant_current_page()
         has_project = bool(local_state.get("project_id"))
+        file_intent = any(
+            token in lowered
+            for token in [
+                "generate using file",
+                "generate using files",
+                "generate through file",
+                "generate through files",
+                "upload file",
+                "upload files",
+                "from file",
+                "from files",
+            ]
+        )
+
+        if file_intent and not has_project:
+            select_setup_mode("csv")
+            assistant_set_page("input")
+            return {
+                "reply": "I opened CSV Input. Please upload your file below to start generation from files.",
+                "action": {},
+                "source": "local",
+                "model": None,
+            }
 
         if page == "upload" and "csv" in lowered and any(token in lowered for token in ["upload", "use", "select", "choose"]):
             select_setup_mode("csv")
@@ -907,16 +966,16 @@ async def main_page() -> None:
                 return {"reply": "Creating the schema project now.", "action": {}, "source": "local", "model": None}
 
         rows_match = re.search(r"(\d+)\s*(?:rows?|lines?)", lowered)
-        if page == "generate" and rows_match:
+        if page in {"generate", "output"} and rows_match:
             local_state["num_rows"] = max(1, int(rows_match.group(1)))
             refresh_all()
             return {"reply": f"Set rows to generate to {local_state['num_rows']}.", "action": {}, "source": "local", "model": None}
 
-        if page == "generate" and "parquet" in lowered:
+        if page in {"generate", "output"} and "parquet" in lowered:
             local_state["output_format"] = "parquet"
             refresh_all()
             return {"reply": "Output format set to parquet.", "action": {}, "source": "local", "model": None}
-        if page == "generate" and "csv" in lowered and "upload" not in lowered:
+        if page in {"generate", "output"} and "csv" in lowered and "upload" not in lowered:
             local_state["output_format"] = "csv"
             refresh_all()
             return {"reply": "Output format set to CSV.", "action": {}, "source": "local", "model": None}
@@ -986,6 +1045,12 @@ async def main_page() -> None:
     def should_handle_assistant_locally(message: str) -> bool:
         lowered = str(message or "").strip().lower()
         local_tokens = [
+            "generate using file",
+            "generate using files",
+            "generate through file",
+            "generate through files",
+            "upload file",
+            "upload files",
             "upload csv",
             "use csv",
             "select csv",
@@ -1025,12 +1090,35 @@ async def main_page() -> None:
             "input": "Workspace",
             "project": "Modeling",
             "modeling": "Generate",
-            "generate": "Generate",
+            "generate": "Output" if bool(local_state.get("sample_confirmed")) else "Generate",
+            "output": "Output",
         }
 
         if lowered in {"hi", "hello", "hey", "hii", "hola"}:
             return {
                 "reply": f"Hello, how may I help you? You are currently on {assistant_page_title()}.",
+                "action": action,
+                "source": "local",
+                "model": None,
+            }
+
+        if any(
+            token in lowered
+            for token in [
+                "generate using file",
+                "generate using files",
+                "generate through file",
+                "generate through files",
+                "upload file",
+                "upload files",
+                "from file",
+                "from files",
+            ]
+        ):
+            action["setup_mode"] = "csv"
+            action["target_page"] = "input"
+            return {
+                "reply": "Sure, I switched to CSV flow. Please upload your file below on Input.",
                 "action": action,
                 "source": "local",
                 "model": None,
@@ -1140,19 +1228,19 @@ async def main_page() -> None:
                 actions.append({"label": "Infer Semantics", "action": {"operation": "infer_semantics"}})
             if bool(local_state.get("project_id")):
                 actions.append({"label": "Go to Generate", "action": {"target_page": "generate"}})
-        else:
+        elif page == "generate":
             actions.append({"label": "Go Back", "action": {"target_page": "modeling"}})
             if bool(local_state.get("project_id")):
                 sample_generated = bool(local_state.get("sample_generated"))
                 sample_ready = bool(local_state.get("sample_confirmed"))
-                
                 if not sample_generated:
-                    actions.append({"label": "Generate 5-Row Sample", "action": {"operation": "launch_generation_sample"}})
+                    actions.append({"label": "Generate Sample", "action": {"operation": "launch_generation_sample"}})
                 elif not sample_ready:
                     actions.append({"label": "Approve Sample", "action": {"operation": "approve_sample"}})
-                
-                actions.append({"label": "Refresh Plan", "action": {"operation": "refresh_plan"}})
-            
+                if sample_ready:
+                    actions.append({"label": "Continue to Output", "action": {"target_page": "output"}})
+        else:
+            actions.append({"label": "Go Back", "action": {"target_page": "generate"}})
             sample_ready = bool(local_state.get("sample_confirmed"))
             if sample_ready and local_state.get("task_status") != "running":
                 actions.append({"label": "Generate Full Dataset", "action": {"operation": "launch_generation"}})
@@ -1217,7 +1305,9 @@ async def main_page() -> None:
         if target_page == "modeling":
             return "Modeling opened. Edit columns and relationships below."
         if target_page == "generate":
-            return "Generate opened. First generate and review a 5-row sample preview."
+            return "Generate opened. First generate a 5-row sample download, then approve it."
+        if target_page == "output":
+            return "Output opened. Review settings and launch full generation when ready."
         return ""
 
     def normalize_assistant_action(action: Optional[Dict[str, Any]], message: str = "") -> Dict[str, Any]:
@@ -1256,7 +1346,7 @@ async def main_page() -> None:
 
         if setup_mode in {"csv", "schema"}:
             select_setup_mode(setup_mode)
-        if target_page in {"upload", "input", "project", "modeling", "generate"}:
+        if target_page in {"upload", "input", "project", "modeling", "generate", "output"}:
             if local_state.get("assistant_mode_active"):
                 asyncio.create_task(assistant_navigate_with_save(target_page))
             else:
@@ -1604,12 +1694,7 @@ async def main_page() -> None:
         finally:
             reply = str(data.get("reply") or "").strip() or "I couldn't form a reply for that yet."
             push_assistant_message("assistant", reply)
-            source = data.get("source")
-            model = data.get("model")
-            if source or model:
-                local_state["assistant_meta"] = f"source: {source or 'unknown'} | model: {model or 'unknown'}"
-            else:
-                local_state["assistant_meta"] = None
+            local_state["assistant_meta"] = None
             apply_assistant_action(normalize_assistant_action(data.get("action"), message))
             local_state["assistant_busy"] = False
             refresh_all()
@@ -1904,50 +1989,17 @@ async def main_page() -> None:
                 sync_generation_table_settings()
                 sample_generated = bool(local_state.get("sample_generated"))
                 sample_ready = bool(local_state.get("sample_confirmed"))
-                table_names = generation_table_names()
-                selected_generation_table = str(local_state.get("selected_generation_table") or (table_names[0] if table_names else "")).strip()
-                active_generation_settings = generation_settings_for(selected_generation_table)
 
                 if not sample_generated:
-                    ui.label("Step 1: Generate a 5-row sample first so you can review the output before setting final generation values.").classes(
+                    ui.label("Step 1: Generate a 5-row sample. It will download automatically.").classes(
                         "text-sm text-slate-500 mt-2"
                     )
                 elif not sample_ready:
-                    ui.label("Step 2: Review the sample below and approve it. Once approved, table-wise rows and seed controls will appear here.").classes(
+                    ui.label("Step 2: Approve the sample to unlock Output.").classes(
                         "text-sm text-slate-500 mt-2"
                     )
                 else:
-                    ui.label("Step 3: Configure per-table rows and seed, then launch the full dataset.").classes(
-                        "text-sm text-slate-500 mt-2"
-                    )
-                    if table_names:
-                        with ui.row().classes("w-full gap-3 flex-wrap mt-3 items-end"):
-                            ui.select(
-                                table_names,
-                                label="Table",
-                                value=selected_generation_table if selected_generation_table in table_names else table_names[0],
-                                on_change=lambda e: set_selected_generation_table(str(e.value or "")),
-                            ).props("outlined").classes("w-48")
-                            ui.number(
-                                label="Rows to generate",
-                                value=int(active_generation_settings.get("num_rows") or 1),
-                                on_change=lambda e: set_generation_table_rows(e.value),
-                            ).props("min=1 step=100 outlined").classes("w-44")
-                            ui.number(
-                                label="Seed",
-                                value=int(active_generation_settings.get("seed") or 42),
-                                on_change=lambda e: set_generation_table_seed(e.value),
-                            ).props("outlined").classes("w-36")
-                    with ui.column().classes("gap-1 mt-3"):
-                        ui.label("Output format").classes("text-xs font-bold uppercase tracking-wide text-slate-500")
-                        ui.radio(["csv", "parquet"], value="csv").bind_value(local_state, "output_format").props("inline")
-                    if table_names:
-                        ui.label("Current table settings").classes("text-xs font-bold uppercase tracking-wide text-slate-500 mt-3")
-                        for table_name in table_names:
-                            cfg = (local_state.get("generation_table_settings") or {}).get(table_name) or {}
-                            ui.label(
-                                f"> {table_name}: rows={int(cfg.get('num_rows') or 1)}, seed={int(cfg.get('seed') if cfg.get('seed') is not None else 42)}"
-                            ).classes("text-xs mono text-slate-600")
+                    ui.label("Sample approved. Continue to Output for full generation.").classes("text-sm text-emerald-700 mt-2")
                 ui.label(f"Status: {str(local_state.get('task_status') or 'idle').upper()}").classes("text-xs text-slate-500")
                 ui.linear_progress(
                     value=max(0.0, min(1.0, float(local_state.get("task_progress") or 0) / 100.0))
@@ -1956,23 +2008,37 @@ async def main_page() -> None:
                     with ui.scroll_area().classes("h-36 w-full mt-3"):
                         for line in local_state["task_logs"][-10:]:
                             ui.label(f"> {line}").classes("text-xs mono text-slate-600")
-                
-                # Show sample preview if generated
-                if local_state.get("sample_preview_tables"):
-                    ui.label("Sample Preview (5 rows)").classes("text-xs font-bold uppercase tracking-wide text-slate-500 mt-4")
-                    for preview_table in local_state["sample_preview_tables"]:
-                        table_name = str(preview_table.get("table_name") or "preview")
-                        rows = list(preview_table.get("rows") or [])
-                        columns = list(preview_table.get("columns") or [])
-                        if rows and columns:
-                            ui.label(f"Table: {table_name}").classes("text-xs font-semibold text-slate-700 mb-1")
-                            ui.aggrid(
-                                {
-                                    "columnDefs": [{"headerName": col, "field": col, "sortable": True, "filter": True} for col in columns],
-                                    "rowData": rows,
-                                    "defaultColDef": {"resizable": True},
-                                }
-                            ).classes("h-40 w-full mb-2")
+        elif page == "output":
+            with ui.card().classes("w-full bg-slate-50 border border-slate-200 rounded-xl p-4 shadow-none"):
+                ui.label("Chat Flow: Output").classes("text-sm font-bold text-slate-700")
+                ui.label("Review settings, launch full generation, and download the dataset.").classes(
+                    "text-sm text-slate-500 mt-2"
+                )
+                sync_generation_table_settings()
+                table_names = generation_table_names()
+                selected_generation_table = str(local_state.get("selected_generation_table") or (table_names[0] if table_names else "")).strip()
+                active_generation_settings = generation_settings_for(selected_generation_table)
+                if table_names:
+                    with ui.row().classes("w-full gap-3 flex-wrap mt-3 items-end"):
+                        ui.select(
+                            table_names,
+                            label="Table",
+                            value=selected_generation_table if selected_generation_table in table_names else table_names[0],
+                            on_change=lambda e: set_selected_generation_table(str(e.value or "")),
+                        ).props("outlined").classes("w-48")
+                        ui.number(
+                            label="Rows to generate",
+                            value=int(active_generation_settings.get("num_rows") or 1),
+                            on_change=lambda e: set_generation_table_rows(e.value),
+                        ).props("min=1 step=100 outlined").classes("w-44")
+                        ui.number(
+                            label="Seed",
+                            value=int(active_generation_settings.get("seed") or 42),
+                            on_change=lambda e: set_generation_table_seed(e.value),
+                        ).props("outlined").classes("w-36")
+                    with ui.column().classes("gap-1 mt-2"):
+                        ui.label("Output format").classes("text-xs font-bold uppercase tracking-wide text-slate-500")
+                        ui.radio(["csv", "parquet"], value="csv").bind_value(local_state, "output_format").props("inline")
 
     async def refresh_correlations(table_id: str) -> None:
         if not local_state["project_id"] or not table_id or local_state["is_loading_correlation"]:
@@ -2016,6 +2082,8 @@ async def main_page() -> None:
         if not stage_open(name):
             if name == "input":
                 safe_notify("Select a setup mode first.", notify_type="warning")
+            elif name == "output":
+                safe_notify("Generate and approve a sample first.", notify_type="warning")
             else:
                 safe_notify("Set up a project first.", notify_type="warning")
             return
@@ -2023,10 +2091,10 @@ async def main_page() -> None:
         if not local_state.get("assistant_mode_active"):
             local_state["assistant_page"] = name
         app.storage.user["active_page"] = name
-        if name in {"project", "modeling", "generate"}:
+        if name in {"project", "modeling", "generate", "output"}:
             asyncio.create_task(
                 load_project(
-                    refresh_plan=name == "generate",
+                    refresh_plan=name in {"generate", "output"},
                     refresh_summary=name == "project",
                 )
             )
@@ -2039,6 +2107,7 @@ async def main_page() -> None:
         safe_refresh(project_view)
         safe_refresh(modeling_view)
         safe_refresh(generate_view)
+        safe_refresh(output_view)
         safe_refresh(assistant_widget)
 
     async def handle_csv_upload(e: events.UploadEventArguments) -> None:
@@ -2478,6 +2547,8 @@ async def main_page() -> None:
                         local_state["sample_generated"] = True
                         local_state["sample_confirmed"] = False
                         asyncio.create_task(fetch_sample_preview(local_state.get("task_id")))
+                        if local_state.get("task_file_url"):
+                            local_state["pending_download_url"] = local_state["task_file_url"]
                 refresh_all()
                 if local_state["task_status"] in {"done", "failed"}:
                     break
@@ -2537,11 +2608,25 @@ async def main_page() -> None:
                             f"Expanded {table_name}.{column_name}: {expanded_values}"
                         )
                 refresh_all()
+            raw_table_settings = dict(local_state.get("generation_table_settings") or {})
+            if sample_only:
+                # Force true 5-row sampling per table so backend table settings cannot override the sample size.
+                sample_table_settings = {}
+                for table_name in generation_table_names():
+                    existing = dict(raw_table_settings.get(table_name) or {})
+                    sample_table_settings[table_name] = {
+                        **existing,
+                        "num_rows": 5,
+                    }
+                table_settings_payload = sample_table_settings
+            else:
+                table_settings_payload = raw_table_settings
+
             params = {
                 "num_rows": effective_rows,
                 "seed": int(local_state["seed"]),
                 "format": local_state["output_format"],
-                "table_settings_json": json.dumps(local_state.get("generation_table_settings") or {}),
+                "table_settings_json": json.dumps(table_settings_payload),
                 "stddev_scale": float(max(0.0, local_state["stddev_scale"])),
                 "variation_pct": float(max(0.0, local_state["variation_pct"])),
                 "knn_smoothing": float(min(1.0, max(0.0, local_state["knn_smoothing"]))),
@@ -2586,8 +2671,8 @@ async def main_page() -> None:
                 safe_notify("Please resolve modeling issues before moving forward.", notify_type="warning")
                 return
         assistant_set_page(target_page)
-        if target_page in {"project", "modeling", "generate"} and local_state.get("project_id"):
-            await load_project(refresh_plan=target_page == "generate", refresh_summary=target_page == "project")
+        if target_page in {"project", "modeling", "generate", "output"} and local_state.get("project_id"):
+            await load_project(refresh_plan=target_page in {"generate", "output"}, refresh_summary=target_page == "project")
 
     def on_modeling_type_changed(col: Dict[str, Any], expand_box: Any) -> None:
         col["data_type"] = normalize_data_type_value(col.get("data_type"))
@@ -2628,18 +2713,37 @@ async def main_page() -> None:
         width_class = "w-56" if compact else "w-64"
         stat_class = "w-20" if compact else "w-24"
         variance_class = "w-24" if compact else "w-28"
+        date_stat_class = "w-28" if compact else "w-32"
+
+        def render_date_bound_input(col: Dict[str, Any], key: str, label: str) -> None:
+            initial = _normalized_date_text(col.get(key))
+            with ui.row().classes(f"{date_stat_class} items-end no-wrap gap-1"):
+                date_input = ui.input(label, value=initial).classes("grow min-w-0")
+                date_input.props("dense")
+                date_input.on_value_change(lambda e, c=col, k=key: c.__setitem__(k, str(e.value or "").strip()))
+                with ui.menu() as picker_menu:
+                    picker = ui.date(value=initial or None).props("mask=YYYY-MM-DD")
+                    picker.on_value_change(
+                        lambda e, c=col, k=key, inp=date_input, m=picker_menu: (
+                            c.__setitem__(k, str(e.value or "").strip()),
+                            inp.set_value(str(e.value or "").strip()),
+                            m.close(),
+                        )
+                    )
+                ui.button(icon="event", on_click=lambda m=picker_menu: m.open()).props("flat dense round size=sm").classes(
+                    "mb-1"
+                )
         collapsed = is_modeling_table_collapsed(table)
         with ui.card().classes("glass-panel p-0 overflow-hidden w-full"):
-            with ui.row().classes(
-                "w-full px-4 py-2 items-center justify-between gap-3 text-white"
-            ).style("background-color: var(--nexus-brand);"):
+            header_row = ui.row().classes(
+                "w-full px-4 py-2 items-center justify-between gap-3 text-white cursor-pointer select-none"
+            ).style("background-color: var(--nexus-brand);")
+            header_row.on("click", lambda _, t=table: toggle_modeling_table(t))
+            with header_row:
                 with ui.row().classes("items-center gap-3"):
                     ui.label(f"TABLE: {table['name']}").classes("font-bold text-sm tracking-wider")
                     ui.label(f"{len(table.get('columns', []))} columns").classes("text-xs font-semibold text-slate-100")
-                ui.button(
-                    icon="expand_more" if collapsed else "expand_less",
-                    on_click=lambda _, t=table: toggle_modeling_table(t),
-                ).props("flat round dense color=white").classes("ml-auto")
+                ui.icon("expand_more" if collapsed else "expand_less").classes("ml-auto text-white")
             def render_editor_rows() -> None:
                 with ui.column().classes("p-4 gap-1"):
                     for col in table.get("columns", []):
@@ -2672,6 +2776,7 @@ async def main_page() -> None:
                             with ui.row().classes("w-full items-center gap-2 mt-1 flex-wrap"):
                                 ui.number("Null %", format="%.2f").bind_value(col, "null_value_percent").classes(stat_class)
                                 is_numeric = _column_is_numeric(col)
+                                is_datetime = _column_is_datetime(col)
                                 if is_numeric:
                                     min_input = ui.number("Min").bind_value(col, "min_val").classes(stat_class)
                                     max_input = ui.number("Max").bind_value(col, "max_val").classes(stat_class)
@@ -2679,6 +2784,15 @@ async def main_page() -> None:
                                     var_input = ui.number("Variance", format="%.4f").bind_value(col, "variance").classes(variance_class)
                                     for field in (min_input, max_input, sd_input, var_input):
                                         field.set_enabled(True)
+                                elif is_datetime:
+                                    render_date_bound_input(col, "min_val", "Min")
+                                    render_date_bound_input(col, "max_val", "Max")
+                                    sd_input = ui.input("Std Dev").classes(variance_class)
+                                    var_input = ui.input("Variance").classes(variance_class)
+                                    sd_input.set_value("" if col.get("sd") is None else str(col.get("sd")))
+                                    var_input.set_value("" if col.get("variance") is None else str(col.get("variance")))
+                                    sd_input.set_enabled(False)
+                                    var_input.set_enabled(False)
                                 else:
                                     ui.input("Min").bind_value(col, "min_val").classes(stat_class)
                                     ui.input("Max").bind_value(col, "max_val").classes(stat_class)
@@ -2748,6 +2862,16 @@ async def main_page() -> None:
         return col.get("generator_type") in ("integer", "numerical") or any(
             token in str(col.get("data_type") or "").upper() for token in ["INT", "NUM", "DEC", "DOUBLE", "FLOAT", "REAL"]
         )
+
+    def _column_is_datetime(col: Dict[str, Any]) -> bool:
+        dtype = str(col.get("data_type") or "").upper()
+        return col.get("generator_type") == "datetime" or any(token in dtype for token in ["DATE", "TIME", "TIMESTAMP", "DATETIME"])
+
+    def _normalized_date_text(value: Any) -> str:
+        text = str(value or "").strip()
+        if len(text) >= 10 and text[4:5] == "-" and text[7:8] == "-":
+            return text[:10]
+        return text
 
     def normalize_project_columns() -> None:
         project_data = local_state.get("project_data") or {}
@@ -3213,13 +3337,14 @@ async def main_page() -> None:
 
         with ui.column().classes("w-full gap-4 fade-up"):
             render_page_header(
-                f"Review The Workspace For {project['name']}",
+                f"Review The Workspace",
                 "Use this step to understand tables, data profiles, and relationships before you fine-tune generation behavior.",
             )
 
             with ui.card().classes("glass-panel p-5"):
                 with ui.row().classes("w-full items-center justify-between gap-2 mb-2"):
-                    ui.label("Project Summary").classes("text-sm font-bold text-slate-700")
+                    summary_hdr = ui.label("Project Summary").classes("text-sm font-bold text-slate-700")
+                    attach_tooltip(summary_hdr, "High-level AI summary of the current project structure and intent.")
                     refresh_summary_btn = action_button(
                         "Refresh AI Summary",
                         icon="auto_awesome",
@@ -3235,32 +3360,30 @@ async def main_page() -> None:
                         ui.label("Generating concise summary...")
                 elif local_state["project_summary"] and local_state["project_summary"].get("summary"):
                     ui.label(local_state["project_summary"]["summary"]).classes("text-base leading-6 text-slate-700")
-                    source = local_state["project_summary"].get("source", "unknown")
-                    model = local_state["project_summary"].get("model")
-                    meta_text = f"source: {source}"
-                    if model:
-                        meta_text += f" | model: {model}"
-                    ui.label(meta_text).classes("text-xs text-slate-400 mt-1")
                 else:
                     ui.label("Summary unavailable. Click refresh to generate one.").classes("text-sm text-slate-500 italic")
 
             with ui.row().classes("w-full gap-3 flex-wrap"):
                 with ui.card().classes("glass-panel p-4 min-w-40"):
-                    ui.label("Tables").classes("text-xs text-slate-500")
+                    tables_hdr = ui.label("Tables").classes("text-xs text-slate-500")
+                    attach_tooltip(tables_hdr, "Total number of tables currently detected in this project.")
                     ui.label(str(len(tables))).classes("text-h5 font-extrabold")
                 with ui.card().classes("glass-panel p-4 min-w-40"):
-                    ui.label("Relations").classes("text-xs text-slate-500")
+                    relations_hdr = ui.label("Relations").classes("text-xs text-slate-500")
+                    attach_tooltip(relations_hdr, "Number of table-to-table relationships detected or defined.")
                     ui.label(str(len(relations))).classes("text-h5 font-extrabold")
                 with ui.card().classes("glass-panel p-4 min-w-40"):
-                    ui.label("Source").classes("text-xs text-slate-500")
+                    source_hdr = ui.label("Source").classes("text-xs text-slate-500")
+                    attach_tooltip(source_hdr, "Project source type, such as CSV ingestion or schema studio.")
                     ui.label(str(project.get("source_type", "UNKNOWN"))).classes("text-h6 font-bold")
 
             with ui.row().classes("w-full gap-4 flex-wrap"):
-                with ui.card().classes("glass-panel p-4 flex-1 min-w-72"):
+                with ui.card().classes("glass-panel p-4 w-full"):
                     names = [t["name"] for t in tables]
                     if names and local_state["selected_table"] not in names:
                         local_state["selected_table"] = names[0]
-                    ui.label("Data Profile").classes("text-lg font-bold mb-2").style("color: var(--nexus-brand);")
+                    data_profile_hdr = ui.label("Data Profile").classes("text-lg font-bold mb-2").style("color: var(--nexus-brand);")
+                    attach_tooltip(data_profile_hdr, "Column-level profile for the selected table.")
                     ui.select(
                         names,
                         value=local_state["selected_table"],
@@ -3286,88 +3409,89 @@ async def main_page() -> None:
                             if local_state.get("correlation_table_id") != selected.get("id"):
                                 asyncio.create_task(refresh_correlations(str(selected.get("id") or "")))
                             ui.separator().classes("my-3 opacity-30")
-                            ui.label("Correlation (numeric columns)").classes("text-sm font-bold text-slate-700 mb-1")
-                            if local_state["is_loading_correlation"]:
-                                with ui.row().classes("items-center gap-2 text-slate-500"):
-                                    ui.spinner(size="sm")
-                                    ui.label("Computing correlations...")
-                            elif local_state["correlation_rows"]:
-                                _corr_fmt = ":javascript(params.value == null ? '\u2014' : params.value.toFixed(3))"
-                                ui.aggrid(
-                                    {
-                                        "columnDefs": [
-                                            {"headerName": "Column A", "field": "col_a", "minWidth": 160},
-                                            {"headerName": "Column B", "field": "col_b", "minWidth": 160},
-                                            {"headerName": "Correlation", "field": "corr", "width": 140, "valueFormatter": _corr_fmt},
-                                        ],
-                                        "rowData": local_state["correlation_rows"],
-                                        "defaultColDef": {"resizable": True},
-                                    }
-                                ).classes("h-56 w-full")
-                            else:
-                                note = local_state.get("correlation_note") or "Not enough numeric data to compute correlations."
-                                ui.label(note).classes("text-xs text-slate-500 italic")
+                            corr_exp = ui.expansion("Correlation (numeric columns)", value=False).classes("w-full")
+                            attach_tooltip(corr_exp, "Linear correlation between numeric columns in the selected table.")
+                            with corr_exp:
+                                if local_state["is_loading_correlation"]:
+                                    with ui.row().classes("items-center gap-2 text-slate-500"):
+                                        ui.spinner(size="sm")
+                                        ui.label("Computing correlations...")
+                                elif local_state["correlation_rows"]:
+                                    _corr_fmt = ":javascript(params.value == null ? '\u2014' : params.value.toFixed(3))"
+                                    ui.aggrid(
+                                        {
+                                            "columnDefs": [
+                                                {"headerName": "Column A", "field": "col_a", "minWidth": 160},
+                                                {"headerName": "Column B", "field": "col_b", "minWidth": 160},
+                                                {"headerName": "Correlation", "field": "corr", "width": 140, "valueFormatter": _corr_fmt},
+                                            ],
+                                            "rowData": local_state["correlation_rows"],
+                                            "defaultColDef": {"resizable": True},
+                                        }
+                                    ).classes("h-56 w-full")
+                                else:
+                                    note = local_state.get("correlation_note") or "Not enough numeric data to compute correlations."
+                                    ui.label(note).classes("text-xs text-slate-500 italic")
 
                             ui.separator().classes("my-3 opacity-30")
-                            ui.label("Same-table Associations (categorical)").classes("text-sm font-bold text-slate-700 mb-1")
-                            if local_state["is_loading_correlation"]:
-                                with ui.row().classes("items-center gap-2 text-slate-500"):
-                                    ui.spinner(size="sm")
-                                    ui.label("Computing associations...")
-                            elif local_state["association_rows"]:
-                                _assoc_fmt = ":javascript(params.value == null ? '\u2014' : params.value.toFixed(3))"
-                                ui.aggrid(
-                                    {
-                                        "columnDefs": [
-                                            {"headerName": "Column A", "field": "col_a", "minWidth": 160},
-                                            {"headerName": "Column B", "field": "col_b", "minWidth": 160},
-                                            {"headerName": "Association", "field": "score", "width": 140, "valueFormatter": _assoc_fmt},
-                                            {"headerName": "Metric", "field": "metric", "width": 120},
-                                        ],
-                                        "rowData": local_state["association_rows"],
-                                        "defaultColDef": {"resizable": True},
-                                    }
-                                ).classes("h-56 w-full")
-                            else:
-                                note = local_state.get("association_note") or "Not enough categorical data to compute associations."
-                                ui.label(note).classes("text-xs text-slate-500 italic")
+                            assoc_exp = ui.expansion("Same-table Associations (categorical)", value=False).classes("w-full")
+                            attach_tooltip(assoc_exp, "Association strength between categorical columns in the same table.")
+                            with assoc_exp:
+                                if local_state["is_loading_correlation"]:
+                                    with ui.row().classes("items-center gap-2 text-slate-500"):
+                                        ui.spinner(size="sm")
+                                        ui.label("Computing associations...")
+                                elif local_state["association_rows"]:
+                                    _assoc_fmt = ":javascript(params.value == null ? '\u2014' : params.value.toFixed(3))"
+                                    ui.aggrid(
+                                        {
+                                            "columnDefs": [
+                                                {"headerName": "Column A", "field": "col_a", "minWidth": 160},
+                                                {"headerName": "Column B", "field": "col_b", "minWidth": 160},
+                                                {"headerName": "Association", "field": "score", "width": 140, "valueFormatter": _assoc_fmt},
+                                                {"headerName": "Metric", "field": "metric", "width": 120},
+                                            ],
+                                            "rowData": local_state["association_rows"],
+                                            "defaultColDef": {"resizable": True},
+                                        }
+                                    ).classes("h-56 w-full")
+                                else:
+                                    note = local_state.get("association_note") or "Not enough categorical data to compute associations."
+                                    ui.label(note).classes("text-xs text-slate-500 italic")
 
                             ui.separator().classes("my-3 opacity-30")
-                            ui.label("LLM Associations (same table)").classes("text-sm font-bold text-slate-700 mb-1")
-                            if local_state["is_loading_correlation"]:
-                                with ui.row().classes("items-center gap-2 text-slate-500"):
-                                    ui.spinner(size="sm")
-                                    ui.label("Inferring associations with LLM...")
-                            elif local_state["llm_association_rows"]:
-                                _llm_fmt = ":javascript(params.value == null ? '\u2014' : params.value.toFixed(3))"
-                                ui.aggrid(
-                                    {
-                                        "columnDefs": [
-                                            {"headerName": "Column A", "field": "col_a", "minWidth": 160},
-                                            {"headerName": "Column B", "field": "col_b", "minWidth": 160},
-                                            {"headerName": "Association", "field": "association", "width": 160},
-                                            {"headerName": "Confidence", "field": "confidence", "width": 140, "valueFormatter": _llm_fmt},
-                                            {"headerName": "Reason", "field": "reason", "minWidth": 240},
-                                        ],
-                                        "rowData": local_state["llm_association_rows"],
-                                        "defaultColDef": {"resizable": True},
-                                    }
-                                ).classes("h-64 w-full")
-                                if local_state.get("llm_association_meta"):
-                                    ui.label(local_state["llm_association_meta"]).classes("text-xs text-slate-400 mt-1")
-                            else:
-                                note = local_state.get("llm_association_note") or "LLM did not return associations."
-                                ui.label(note).classes("text-xs text-slate-500 italic")
-
-                with ui.card().classes("glass-panel p-4 flex-1 min-w-72"):
-                    ui.label("Relation Graph").classes("text-lg font-bold mb-2").style("color: var(--nexus-brand);")
-                    if relations:
-                        mermaid = "graph TD\n"
-                        for rel in relations:
-                            mermaid += f"    {rel['to_table']} --> {rel['from_table']}\n"
-                        ui.mermaid(mermaid).classes("w-full h-80")
-                    else:
-                        ui.label("No relationships detected yet.").classes("text-sm text-slate-500 italic")
+                            llm_assoc_exp = ui.expansion("LLM Associations (same table)", value=False).classes("w-full")
+                            attach_tooltip(llm_assoc_exp, "LLM-inferred semantic relationships between columns in the selected table.")
+                            with llm_assoc_exp:
+                                if local_state["is_loading_correlation"]:
+                                    with ui.row().classes("items-center gap-2 text-slate-500"):
+                                        ui.spinner(size="sm")
+                                        ui.label("Inferring associations with LLM...")
+                                elif local_state["llm_association_rows"]:
+                                    _llm_fmt = ":javascript(params.value == null ? '\u2014' : params.value.toFixed(3))"
+                                    ui.aggrid(
+                                        {
+                                            "columnDefs": [
+                                                {"headerName": "Column A", "field": "col_a", "minWidth": 160},
+                                                {"headerName": "Column B", "field": "col_b", "minWidth": 160},
+                                                {"headerName": "Association", "field": "association", "width": 160},
+                                                {"headerName": "Confidence", "field": "confidence", "width": 140, "valueFormatter": _llm_fmt},
+                                                {
+                                                    "headerName": "Reason",
+                                                    "field": "reason",
+                                                    "minWidth": 900,
+                                                    "tooltipField": "reason",
+                                                    "cellStyle": {"white-space": "nowrap"},
+                                                },
+                                            ],
+                                            "rowData": local_state["llm_association_rows"],
+                                            "defaultColDef": {"resizable": True},
+                                            "alwaysShowHorizontalScroll": True,
+                                        }
+                                    ).classes("h-64 w-full")
+                                else:
+                                    note = local_state.get("llm_association_note") or "LLM did not return associations."
+                                    ui.label(note).classes("text-xs text-slate-500 italic")
 
             with ui.row().classes(ACTION_BAR):
                 action_button("Back to Setup", icon="arrow_back", on_click=lambda: go_to_page("upload"), variant="outline")
@@ -3388,7 +3512,7 @@ async def main_page() -> None:
 
         with ui.column().classes("w-full gap-4 fade-up"):
             render_page_header(
-                "Tune Column Rules Before Generation",
+                "Modeling",
                 "Review each table, then refine types, null handling, privacy, allowed values, and relationships.",
             )
             if local_state["is_inferring_semantics"]:
@@ -3586,6 +3710,46 @@ async def main_page() -> None:
                     variant="primary",
                 )
 
+    def render_generation_settings_card() -> None:
+        sync_generation_table_settings()
+        table_names = generation_table_names()
+        selected_generation_table = str(
+            local_state.get("selected_generation_table") or (table_names[0] if table_names else "")
+        ).strip()
+        active_generation_settings = generation_settings_for(selected_generation_table)
+        with ui.card().classes("glass-panel p-5 lift w-full"):
+            ui.label("Generation Settings").classes("text-xl font-extrabold mb-4").style("color: var(--nexus-brand);")
+            ui.label("Configure rows and seed per table for the final generation run.").classes("text-sm text-slate-500 mb-1")
+            if table_names:
+                ui.select(
+                    table_names,
+                    label="Table",
+                    value=selected_generation_table if selected_generation_table in table_names else table_names[0],
+                    on_change=lambda e: set_selected_generation_table(str(e.value or "")),
+                ).props("outlined").classes("w-full mb-2")
+                ui.number(
+                    label="Rows to generate",
+                    value=int(active_generation_settings.get("num_rows") or 1),
+                    on_change=lambda e: set_generation_table_rows(e.value),
+                ).props("outlined").classes("w-full mb-2")
+                ui.number(
+                    label="Seed",
+                    value=int(active_generation_settings.get("seed") or 42),
+                    on_change=lambda e: set_generation_table_seed(e.value),
+                ).props("outlined").classes("w-full mb-2")
+                with ui.column().classes("gap-1 mt-2"):
+                    ui.label("Current table settings").classes("text-xs font-bold uppercase tracking-wide text-slate-500")
+                    for table_name in table_names:
+                        cfg = (local_state.get("generation_table_settings") or {}).get(table_name) or {}
+                        ui.label(
+                            f"> {table_name}: rows={int(cfg.get('num_rows') or 1)}, seed={int(cfg.get('seed') if cfg.get('seed') is not None else 42)}"
+                        ).classes("text-xs mono text-slate-600")
+            else:
+                ui.label("No tables are available yet. Return to Input or Workspace and load a project first.").classes(
+                    "text-sm text-slate-500 mb-3"
+                )
+            ui.radio(["csv", "parquet"], value="csv").bind_value(local_state, "output_format").props("inline")
+
     @ui.refreshable
     def generate_view() -> None:
         if local_state["page"] != "generate":
@@ -3593,156 +3757,160 @@ async def main_page() -> None:
         if not local_state["project_data"]:
             ui.label("No project loaded.").classes("text-slate-500")
             return
+        flush_pending_download()
 
         render_page_header(
-            "Preview, Approve, And Generate Output",
-            "Confirm the current setup, generate a sample preview, approve it, then launch the full synthetic dataset.",
+            "Generate A Sample",
+            "Step 1 of 2: generate and download a 5-row sample, then approve it to continue to Output.",
         )
-        overview_rows = current_generation_overview()
         sample_generated = bool(local_state.get("sample_generated"))
         sample_ready = bool(local_state.get("sample_confirmed"))
-        sync_generation_table_settings()
-        table_names = generation_table_names()
-        selected_generation_table = str(local_state.get("selected_generation_table") or (table_names[0] if table_names else "")).strip()
-        active_generation_settings = generation_settings_for(selected_generation_table)
-        with ui.row().classes("w-full gap-4 flex-wrap items-stretch fade-up"):
-            with ui.column().classes("flex-1 basis-[28rem] min-w-[22rem] gap-4"):
-                with ui.card().classes("glass-panel p-5 h-full w-full"):
-                    ui.label("Step 1: Generate A Sample").classes("text-lg font-bold mb-2").style("color: var(--nexus-brand);")
-                    ui.label("Generate a 5-row preview here, review it in the dropdown, then approve it before you launch the full dataset.").classes("text-sm text-slate-500 mb-3")
-                    sample_btn = action_button(
-                        "Generate 5-Row Sample",
-                        icon="preview",
-                        on_click=lambda: asyncio.create_task(start_generation(sample_only=True)),
-                        variant="outline",
-                    )
-                    sample_btn.set_enabled(local_state["task_status"] != "running")
-                    if local_state.get("sample_preview_error"):
-                        ui.label(f"Preview unavailable: {local_state['sample_preview_error']}").classes("text-xs text-rose-600 mt-2")
-                    if local_state.get("sample_preview_tables"):
-                        with ui.expansion("Preview Sample Rows", value=False).classes("w-full mt-3"):
-                            for preview_table in local_state["sample_preview_tables"]:
-                                table_name = str(preview_table.get("table_name") or "preview")
-                                rows = list(preview_table.get("rows") or [])
-                                columns = list(preview_table.get("columns") or [])
-                                ui.label(f"{table_name}").classes("text-sm font-bold text-slate-700 mb-2")
-                                if rows and columns:
-                                    ui.aggrid(
-                                        {
-                                            "columnDefs": [{"headerName": col, "field": col, "sortable": True, "filter": True} for col in columns],
-                                            "rowData": rows,
-                                            "defaultColDef": {"resizable": True},
-                                        }
-                                    ).classes("h-52 w-full mb-3")
-                                else:
-                                    ui.label("No preview rows available.").classes("text-xs text-slate-500 mb-3")
-                    if sample_generated and not sample_ready:
-                        ui.label("Step 2: Approve the sample when it looks correct to unlock the full run.").classes("text-xs text-slate-500 mt-2")
-                        action_button(
-                            "Approve Sample",
-                            icon="check_circle",
-                            on_click=approve_sample_preview,
-                            variant="success",
-                            compact=True,
-                        ).classes("mt-2")
-                    else:
-                        ui.label(
-                            "The sample has been approved. You can generate the full dataset below."
-                            if sample_ready
-                            else "Generate a sample first to unlock the full run."
-                        ).classes("text-xs text-slate-500 mt-2")
-
-            with ui.column().classes("flex-1 basis-[28rem] min-w-[22rem] gap-4"):
-                with ui.card().classes("glass-panel p-5 lift h-full w-full"):
-                    ui.label("Generation Settings").classes("text-xl font-extrabold mb-4").style("color: var(--nexus-brand);")
-                    ui.label("Choose a table below to configure its row count and seed for the final generation run.").classes(
-                        "text-sm text-slate-500 mb-1"
-                    )
-                    if table_names:
-                        ui.select(
-                            table_names,
-                            label="Table",
-                            value=selected_generation_table if selected_generation_table in table_names else table_names[0],
-                            on_change=lambda e: set_selected_generation_table(str(e.value or "")),
-                        ).props("outlined").classes("w-full mb-2")
-                        ui.number(
-                            label="Rows to generate",
-                            value=int(active_generation_settings.get("num_rows") or 1),
-                            on_change=lambda e: set_generation_table_rows(e.value),
-                        ).props("outlined").classes("w-full mb-2")
-                        ui.number(
-                            label="Seed",
-                            value=int(active_generation_settings.get("seed") or 42),
-                            on_change=lambda e: set_generation_table_seed(e.value),
-                        ).props("outlined").classes("w-full mb-2")
-                    else:
-                        ui.label("No tables are available yet. Return to Input or Workspace and load a project first.").classes(
-                            "text-sm text-slate-500 mb-3"
-                        )
-                    ui.radio(["csv", "parquet"], value="csv").bind_value(local_state, "output_format").props("inline")
-
-        with ui.card().classes("glass-panel p-6 w-full mt-4 fade-up"):
-            ui.label("Step 2: Run Status And Output").classes("text-lg font-bold mb-2").style("color: var(--nexus-brand);")
-            ui.label(
-                "Launch the full dataset after the sample is approved. Expand the logs only when you want more detail."
-            ).classes("text-sm text-slate-500 mb-3")
-            with ui.row().classes("w-full gap-2 flex-wrap mb-3"):
-                for item in overview_rows:
-                    ui.label(item).classes("setup-chip")
-            ui.linear_progress(
-                value=0.0
-            ).bind_value_from(
-                local_state,
-                "task_progress",
-                lambda v: max(0.0, min(1.0, float(v or 0) / 100.0)),
-            ).classes("mt-1 h-4 rounded-full")
-            with ui.row().classes("w-full mt-3 items-center justify-between flex-wrap gap-2"):
-                ui.label().bind_text_from(
-                    local_state, "task_progress", backward=lambda v: f"{int(v)}% complete"
-                ).classes("text-sm font-bold text-slate-600")
-                ui.label().bind_text_from(
-                    local_state, "task_status", backward=lambda v: str(v).upper()
-                ).classes("text-sm font-extrabold px-3 py-1 rounded bg-blue-50").style(
-                    "color: var(--nexus-brand);"
-                )
-            ui.label(
-                "Track generation progress here and download the export once the run completes."
-            ).classes("text-xs text-slate-500 mt-2")
-            if local_state.get("last_generation_kind") == "sample":
+        with ui.column().classes("w-full gap-4 fade-up"):
+            with ui.card().classes("glass-panel p-5 w-full"):
+                ui.label("Step 1: Generate A Sample").classes("text-lg font-bold mb-2").style("color: var(--nexus-brand);")
                 ui.label(
-                    "This run is a preview sample so you can validate the output before full generation."
-                ).classes("text-xs text-emerald-700 mt-1")
-
-            if local_state["task_status"] != "idle":
-                with ui.expansion(f"Run Logs ({len(local_state['task_logs'])} events)", value=False).classes("w-full mt-4"):
-                    with ui.card().classes("w-full p-4 bg-slate-950 text-emerald-300 rounded-xl border border-slate-800"):
-                        with ui.scroll_area().classes("h-72 w-full pr-2"):
-                            for line in local_state["task_logs"]:
-                                ui.label(f"> {line}").classes("text-sm mono mb-1")
-            else:
-                ui.label("Logs will appear here after you start a sample or full generation run.").classes(
-                    "text-xs text-slate-500 mt-4"
+                    "Click below to generate a 5-row sample. The file will download automatically."
+                ).classes("text-sm text-slate-500 mb-3")
+                sample_btn = action_button(
+                    "Generate Sample",
+                    icon="download",
+                    on_click=lambda: asyncio.create_task(start_generation(sample_only=True)),
+                    variant="outline",
                 )
+                sample_btn.set_enabled(local_state["task_status"] != "running")
+                if local_state.get("task_status") == "running" and local_state.get("last_generation_kind") == "sample":
+                    ui.label("Generating sample...").classes("text-xs text-slate-500 mt-2")
+                if sample_generated and not sample_ready:
+                    ui.label("Sample downloaded. Approve it to continue to Output.").classes("text-xs text-slate-500 mt-2")
+                    action_button(
+                        "Approve Sample",
+                        icon="check_circle",
+                        on_click=approve_sample_preview,
+                        variant="success",
+                        compact=True,
+                    ).classes("mt-2")
+                elif sample_ready:
+                    ui.label("Sample approved. Continue to Output to generate the full dataset.").classes("text-xs text-emerald-700 mt-2")
+                else:
+                    ui.label("Generate a sample first to unlock the next step.").classes("text-xs text-slate-500 mt-2")
+
+            if sample_ready:
+                render_generation_settings_card()
+            else:
+                with ui.card().classes("glass-panel p-5 w-full"):
+                    ui.label("Generation Settings").classes("text-xl font-extrabold mb-2").style("color: var(--nexus-brand);")
+                    ui.label(
+                        "Approve the 5-row sample first to unlock full generation settings."
+                    ).classes("text-sm text-slate-500")
 
         with ui.row().classes(f"{ACTION_BAR} mt-4"):
             action_button("Back to Modeling", icon="arrow_back", on_click=lambda: go_to_page("modeling"), variant="outline")
-            launch_btn = action_button(
-                "Generate Full Dataset",
-                icon="bolt",
-                on_click=lambda: asyncio.create_task(start_generation()),
+            continue_btn = action_button(
+                "Continue to Output",
+                icon="arrow_forward",
+                on_click=lambda: go_to_page("output"),
                 variant="primary",
             )
-            launch_btn.set_enabled(local_state["task_status"] != "running" and sample_ready)
-            dl_btn = action_button(
-                "Download Output",
-                icon="download",
-                on_click=handle_download_click,
-                variant="success",
-            )
-            dl_btn.set_enabled(local_state["task_status"] == "done" and bool(local_state["task_file_url"]))
+            continue_btn.set_enabled(sample_ready)
+
+    @ui.refreshable
+    def output_view() -> None:
+        if local_state["page"] != "output":
+            return
+        if not local_state["project_data"]:
+            ui.label("No project loaded.").classes("text-slate-500")
+            return
+        flush_pending_download()
+
+        render_page_header(
+            "Review Settings And Generate Output",
+            "Step 2 of 2: review generation settings, then generate and download the full dataset.",
+        )
+        overview_rows = current_generation_overview()
+        sample_ready = bool(local_state.get("sample_confirmed"))
+        table_names = generation_table_names()
+        output_fmt = str(local_state.get("output_format") or "csv").upper()
+        full_run_visible = str(local_state.get("last_generation_kind") or "") == "full"
+
+        with ui.column().classes("w-full gap-4 fade-up"):
+            with ui.card().classes("glass-panel p-6 w-full"):
+                ui.label("Generation Summary").classes("text-lg font-bold mb-2").style("color: var(--nexus-brand);")
+                ui.label("Review the final run settings below, then start full dataset generation.").classes(
+                    "text-sm text-slate-500 mb-3"
+                )
+                with ui.row().classes("w-full gap-2 flex-wrap mb-2"):
+                    for item in overview_rows:
+                        ui.label(item).classes("setup-chip")
+                    ui.label(f"Output: {output_fmt}").classes("setup-chip")
+                with ui.column().classes("gap-1 mt-2"):
+                    ui.label("Per-table rows and seed").classes("text-xs font-bold uppercase tracking-wide text-slate-500")
+                    for table_name in table_names:
+                        cfg = (local_state.get("generation_table_settings") or {}).get(table_name) or {}
+                        ui.label(
+                            f"> {table_name}: rows={int(cfg.get('num_rows') or 1)}, seed={int(cfg.get('seed') if cfg.get('seed') is not None else 42)}"
+                        ).classes("text-xs mono text-slate-600")
+
+            with ui.row().classes(f"{ACTION_BAR} mt-2"):
+                action_button("Back to Generate", icon="arrow_back", on_click=lambda: go_to_page("generate"), variant="outline")
+                launch_btn = action_button(
+                    "Generate Full Dataset",
+                    icon="bolt",
+                    on_click=lambda: asyncio.create_task(start_generation()),
+                    variant="primary",
+                )
+                launch_btn.set_enabled(local_state["task_status"] != "running" and sample_ready)
+                dl_btn = action_button(
+                    "Download Output",
+                    icon="download",
+                    on_click=handle_download_click,
+                    variant="success",
+                )
+                dl_btn.set_enabled(
+                    str(local_state.get("last_generation_kind") or "") == "full"
+                    and local_state["task_status"] == "done"
+                    and bool(local_state["task_file_url"])
+                )
+
+            if full_run_visible:
+                with ui.card().classes("glass-panel p-6 w-full"):
+                    ui.label("Output Run Status").classes("text-lg font-bold mb-2").style("color: var(--nexus-brand);")
+                    ui.label("Launch full generation after sample approval.").classes("text-sm text-slate-500 mb-3")
+                    with ui.row().classes("w-full gap-2 flex-wrap mb-3"):
+                        for item in overview_rows:
+                            ui.label(item).classes("setup-chip")
+                    ui.linear_progress(value=0.0).bind_value_from(
+                        local_state,
+                        "task_progress",
+                        lambda v: max(0.0, min(1.0, float(v or 0) / 100.0)),
+                    ).classes("mt-1 h-4 rounded-full")
+                    with ui.row().classes("w-full mt-3 items-center justify-between flex-wrap gap-2"):
+                        ui.label().bind_text_from(
+                            local_state, "task_progress", backward=lambda v: f"{int(v)}% complete"
+                        ).classes("text-sm font-bold text-slate-600")
+                        ui.label().bind_text_from(
+                            local_state, "task_status", backward=lambda v: str(v).upper()
+                        ).classes("text-sm font-extrabold px-3 py-1 rounded bg-blue-50").style("color: var(--nexus-brand);")
+                    if local_state["task_status"] != "idle":
+                        with ui.expansion(f"Run Logs ({len(local_state['task_logs'])} events)", value=False).classes("w-full mt-4"):
+                            with ui.card().classes("w-full p-4 bg-slate-950 text-emerald-300 rounded-xl border border-slate-800"):
+                                with ui.scroll_area().classes("h-72 w-full pr-2"):
+                                    for line in local_state["task_logs"]:
+                                        ui.label(f"> {line}").classes("text-sm mono mb-1")
 
     @ui.refreshable
     def assistant_widget() -> None:
+        # Keep chatbot icon/widget only on Setup page
+        if str(local_state.get("page") or "") != "upload":
+            if local_state.get("assistant_open"):
+                local_state["assistant_open"] = False
+            if local_state.get("assistant_fullscreen"):
+                local_state["assistant_fullscreen"] = False
+            return
+
+        # If a sample/full file download was queued from a background task,
+        # flush it here as well so chatbot-driven flows on Setup can auto-download.
+        flush_pending_download()
+
         def render_assistant_shell() -> None:
             shell_classes = "assistant-shell p-0 overflow-hidden"
             if local_state.get("assistant_fullscreen"):
@@ -3802,8 +3970,6 @@ async def main_page() -> None:
                     prompt.on("keydown.enter", lambda _: asyncio.create_task(send_assistant_message()))
                     prompt.set_enabled(not local_state.get("assistant_busy"))
                     with ui.row().classes("w-full items-center justify-between gap-2"):
-                        if local_state.get("assistant_meta"):
-                            ui.label(local_state["assistant_meta"]).classes("text-[11px] text-slate-400")
                         send_btn = action_button(
                             "Send",
                             icon="send",
@@ -3827,10 +3993,10 @@ async def main_page() -> None:
                     attach_tooltip(fab, "Hi 👋 How can I help you today?")
 
 
-    if local_state["project_id"] and local_state["page"] in {"project", "modeling", "generate"}:
+    if local_state["project_id"] and local_state["page"] in {"project", "modeling", "generate", "output"}:
         asyncio.create_task(
             load_project(
-                refresh_plan=local_state["page"] == "generate",
+                refresh_plan=local_state["page"] in {"generate", "output"},
                 refresh_summary=local_state["page"] == "project",
             )
         )
@@ -3842,6 +4008,7 @@ async def main_page() -> None:
         project_view()
         modeling_view()
         generate_view()
+        output_view()
     assistant_widget()
 
 

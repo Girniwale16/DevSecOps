@@ -83,6 +83,67 @@ def _build_prompt(table_name: str, columns: List[Dict[str, Any]]) -> str:
     )
 
 
+def _fallback_associations(columns: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    names = [str(c.get("column_name") or "").strip() for c in columns if str(c.get("column_name") or "").strip()]
+    lowered = [n.lower() for n in names]
+    rows: List[Dict[str, Any]] = []
+
+    # Generic identifier links for *_id columns
+    id_cols = [n for n in names if n.lower().endswith("_id")]
+    for i in range(len(id_cols)):
+        for j in range(i + 1, len(id_cols)):
+            rows.append(
+                {
+                    "col_a": id_cols[i],
+                    "col_b": id_cols[j],
+                    "association": "identifier",
+                    "confidence": 0.68,
+                    "reason": "Heuristic fallback: both columns look like identifier fields.",
+                }
+            )
+
+    def _has(col_key: str) -> Optional[str]:
+        for n in names:
+            if col_key in n.lower():
+                return n
+        return None
+
+    # Common semantic pairs
+    city = _has("city")
+    state = _has("state")
+    country = _has("country")
+    if city and state:
+        rows.append({"col_a": city, "col_b": state, "association": "geography", "confidence": 0.8, "reason": "Heuristic fallback: city/state often form a geographic hierarchy."})
+    if state and country:
+        rows.append({"col_a": state, "col_b": country, "association": "geography", "confidence": 0.8, "reason": "Heuristic fallback: state/country often form a geographic hierarchy."})
+    if city and country:
+        rows.append({"col_a": city, "col_b": country, "association": "geography", "confidence": 0.75, "reason": "Heuristic fallback: city/country are commonly related geographic columns."})
+
+    price = _has("price")
+    cost = _has("cost") or _has("cogs")
+    if price and cost:
+        rows.append({"col_a": price, "col_b": cost, "association": "derived", "confidence": 0.82, "reason": "Heuristic fallback: price and cost columns are commonly mathematically related."})
+
+    category = _has("category")
+    subcategory = _has("subcategory") or _has("sub_category")
+    item_type = _has("type")
+    if category and subcategory:
+        rows.append({"col_a": category, "col_b": subcategory, "association": "hierarchy", "confidence": 0.85, "reason": "Heuristic fallback: category/subcategory names imply hierarchical grouping."})
+    if category and item_type:
+        rows.append({"col_a": category, "col_b": item_type, "association": "hierarchy", "confidence": 0.7, "reason": "Heuristic fallback: category/type names imply related grouping."})
+
+    # De-duplicate preserving order
+    seen = set()
+    deduped: List[Dict[str, Any]] = []
+    for row in rows:
+        key = tuple(sorted([str(row["col_a"]), str(row["col_b"])]))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(row)
+    return deduped[:12]
+
+
 async def infer_column_associations(table_name: str, columns: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not columns:
         return {"source": "none", "model": None, "associations": []}
@@ -90,9 +151,9 @@ async def infer_column_associations(table_name: str, columns: List[Dict[str, Any
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
         return {
-            "source": "none",
+            "source": "heuristic",
             "model": None,
-            "associations": [],
+            "associations": _fallback_associations(columns),
             "error": "GROQ_API_KEY not configured",
         }
 
@@ -120,9 +181,9 @@ async def infer_column_associations(table_name: str, columns: List[Dict[str, Any
             data = resp.json()
     except Exception as ex:
         return {
-            "source": "none",
+            "source": "heuristic",
             "model": None,
-            "associations": [],
+            "associations": _fallback_associations(columns),
             "error": str(ex),
         }
 
@@ -135,9 +196,9 @@ async def infer_column_associations(table_name: str, columns: List[Dict[str, Any
     parsed = _extract_json(content)
     if not parsed or "associations" not in parsed:
         return {
-            "source": "none",
+            "source": "heuristic",
             "model": GROQ_MODEL,
-            "associations": [],
+            "associations": _fallback_associations(columns),
             "error": "Invalid Groq response format",
         }
 
