@@ -10,3 +10,5 @@ backend/data/exports
 backend/data/uploads
 # Virtual environments
 venv
+frontend\main.py.authbak
+backend\app\main.py.authbak
