@@ -3,9 +3,9 @@ import duckdb
 import shutil
 import uuid
 import json
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Body
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Body, Request
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import zipfile
 import io
@@ -28,6 +28,7 @@ from app.engine.relationship_inference import infer_table_relationships
 from app.engine.category_expansion import expand_categorical_column, parse_allowed_values
 from app.engine.association_inference import infer_column_associations
 from app.engine.assistant_chat import infer_assistant_reply
+from app.auth import current_user_from_request, init_auth_storage, is_public_path, log_request_activity, router as auth_router
 import pandas as pd
 import numpy as np
 
@@ -531,11 +532,13 @@ def _load_synth_tables_from_output(output_path: str) -> Dict[str, pd.DataFrame]:
 tasks = {} # task_id -> { status: 'running'|'done'|'failed', progress: 0-100, logs: [], file_path: str }
 
 app = FastAPI(title="DataCosmos API")
+app.include_router(auth_router)
 
 # Initialize metadata DB on startup
 @app.on_event("startup")
 async def startup_event():
     init_db()
+    init_auth_storage()
 
 # Enable CORS for frontend development
 app.add_middleware(
@@ -547,6 +550,18 @@ app.add_middleware(
     expose_headers=["*"],
 )
 
+@app.middleware("http")
+async def auth_guard(request: Request, call_next):
+    if request.method.upper() == "OPTIONS" or is_public_path(request.url.path):
+        return await call_next(request)
+
+    user = current_user_from_request(request)
+    if not user:
+        return JSONResponse(status_code=401, content={"detail": "Authentication required"})
+
+    request.state.user = user
+    return await call_next(request)
+
 UPLOAD_DIR = "data/uploads"
 EXPORT_DIR = "data/exports"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -557,7 +572,7 @@ async def root():
     return {"message": "DataCosmos API is running"}
 
 @app.post("/upload")
-async def upload_csv(file: UploadFile = File(...)):
+async def upload_csv(request: Request, file: UploadFile = File(...)):
     if not file.filename.endswith('.csv'):
         raise HTTPException(status_code=400, detail="Only CSV files are allowed")
     
@@ -596,6 +611,13 @@ async def upload_csv(file: UploadFile = File(...)):
             
         conn.close()
 
+        log_request_activity(
+            request,
+            "upload_csv",
+            project_id=project_id,
+            table_id=table_id,
+            details={"filename": file.filename, "row_count": stats["total_rows"]},
+        )
         return {
             "project_id": project_id,
             "table_id": table_id,
@@ -607,7 +629,7 @@ async def upload_csv(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Error processing CSV: {str(e)}")
 
 @app.post("/upload-ddl")
-async def upload_ddl_api(file: UploadFile = File(...), dialect: str = "postgres"):
+async def upload_ddl_api(request: Request, file: UploadFile = File(...), dialect: str = "postgres"):
     if not file.filename.endswith('.sql'):
         raise HTTPException(status_code=400, detail="Only SQL files are allowed")
     
@@ -648,12 +670,18 @@ async def upload_ddl_api(file: UploadFile = File(...), dialect: str = "postgres"
                     """, (str(uuid.uuid4()), project_id, table["table_name"], from_col, fk["ref_table"], to_col, '1:N', is_optional))
         
         conn.close()
+        log_request_activity(
+            request,
+            "upload_ddl",
+            project_id=project_id,
+            details={"filename": file.filename, "dialect": dialect, "table_count": len(tables)},
+        )
         return {"project_id": project_id, "tables": tables}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DDL Parsing failed: {str(e)}")
 
 @app.post("/upload-schema")
-async def upload_schema(payload = Body(...)):
+async def upload_schema(request: Request, payload = Body(...)):
     if not isinstance(payload, dict):
         raise HTTPException(status_code=422, detail="Invalid payload. Expected JSON object.")
 
@@ -751,6 +779,12 @@ async def upload_schema(payload = Body(...)):
                 }
             )
 
+        log_request_activity(
+            request,
+            "create_schema_project",
+            project_id=project_id,
+            details={"project_name": project_name, "table_count": len(normalized_tables)},
+        )
         return {
             "project_id": project_id,
             "project_name": project_name,
@@ -1001,7 +1035,7 @@ async def get_project_natural_summary(project_id: str):
 
 
 @app.post("/assistant/chat")
-async def assistant_chat(payload=Body(...)):
+async def assistant_chat(request: Request, payload=Body(...)):
     current_page = str((payload or {}).get("page") or "upload").strip().lower()
     setup_mode = str((payload or {}).get("setup_mode") or "").strip().lower()
     project_id = str((payload or {}).get("project_id") or "").strip()
@@ -1048,11 +1082,17 @@ async def assistant_chat(payload=Body(...)):
         history=history if isinstance(history, list) else [],
         message=message,
     )
+    log_request_activity(
+        request,
+        "assistant_chat",
+        project_id=project_id or None,
+        details={"page": current_page, "setup_mode": setup_mode, "message_length": len(message)},
+    )
     return jsonable_encoder(reply)
 
 
 @app.post("/project/{project_id}/config/update")
-async def update_project_config(project_id: str, payload = Body(...)):
+async def update_project_config(project_id: str, request: Request, payload = Body(...)):
     """
     Accepts either:
       1) raw list: [ {id, is_pii, generator_type, randomization_pct}, ... ]
@@ -1138,12 +1178,18 @@ async def update_project_config(project_id: str, payload = Body(...)):
                     update_sql = f"UPDATE column_profiles SET {', '.join(updates)} WHERE column_id = CAST(? AS UUID)"
                     conn.execute(update_sql, params)
             updated_count += 1
+        log_request_activity(
+            request,
+            "update_project_config",
+            project_id=project_id,
+            details={"updated_count": updated_count},
+        )
         return {"message": "Config updated", "updated_count": updated_count}
     finally:
         conn.close()
 
 @app.post("/project/{project_id}/infer-semantic-types")
-async def infer_project_semantic_types(project_id: str, apply: bool = True):
+async def infer_project_semantic_types(project_id: str, request: Request, apply: bool = True):
     """
     Uses Groq LLM (with heuristic fallback) to infer semantic types from column names/types.
     If apply=true, inferred `generator_type` and `is_pii` values are saved into metadata DB.
@@ -1226,6 +1272,12 @@ async def infer_project_semantic_types(project_id: str, apply: bool = True):
             "applied_count": applied_count,
             "suggestions": suggestions,
         }
+        log_request_activity(
+            request,
+            "infer_semantic_types",
+            project_id=project_id,
+            details={"applied": apply, "applied_count": applied_count, "suggestion_count": len(suggestions)},
+        )
         return jsonable_encoder(response_payload)
     except HTTPException:
         raise
@@ -1236,7 +1288,7 @@ async def infer_project_semantic_types(project_id: str, apply: bool = True):
 
 
 @app.post("/project/{project_id}/expand-categories")
-async def expand_project_categories(project_id: str, apply: bool = True, max_values: int = 12):
+async def expand_project_categories(project_id: str, request: Request, apply: bool = True, max_values: int = 12):
     max_values = max(2, min(int(max_values), 25))
     conn = get_db_connection()
     try:
@@ -1304,6 +1356,12 @@ async def expand_project_categories(project_id: str, apply: bool = True, max_val
                 )
                 applied_count += 1
 
+        log_request_activity(
+            request,
+            "expand_categories",
+            project_id=project_id,
+            details={"applied": apply, "applied_count": applied_count, "expanded_count": len(expansions), "max_values": max_values},
+        )
         return jsonable_encoder(
             {
                 "project_id": project_id,
@@ -1321,7 +1379,7 @@ async def expand_project_categories(project_id: str, apply: bool = True, max_val
 
 
 @app.post("/project/{project_id}/detect-pii")
-async def detect_project_pii(project_id: str, apply: bool = True, sample_size: int = 50):
+async def detect_project_pii(project_id: str, request: Request, apply: bool = True, sample_size: int = 50):
     """
     Detects PII columns using column-name signals, value regex signals, and optional spaCy NER.
     If apply=true, updates `columns.is_pii` for the project.
@@ -1396,6 +1454,12 @@ async def detect_project_pii(project_id: str, apply: bool = True, sample_size: i
                 applied_count += 1
 
         pii_count = sum(1 for d in detections if d.get("is_pii"))
+        log_request_activity(
+            request,
+            "detect_pii",
+            project_id=project_id,
+            details={"applied": apply, "applied_count": applied_count, "pii_detected_count": pii_count, "sample_size": sample_size},
+        )
         return jsonable_encoder(
             {
                 "project_id": project_id,
@@ -1414,7 +1478,7 @@ async def detect_project_pii(project_id: str, apply: bool = True, sample_size: i
         conn.close()
 
 @app.post("/project/{project_id}/infer-relations")
-async def infer_project_relations(project_id: str, apply: bool = True):
+async def infer_project_relations(project_id: str, request: Request, apply: bool = True):
     conn = get_db_connection()
     try:
         project_rows = safe_df_to_dict(conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).df())
@@ -1423,6 +1487,12 @@ async def infer_project_relations(project_id: str, apply: bool = True):
 
         raw_tables = safe_df_to_dict(conn.execute("SELECT * FROM tables WHERE project_id = ?", (project_id,)).df())
         if len(raw_tables) <= 1:
+            log_request_activity(
+                request,
+                "infer_relations",
+                project_id=project_id,
+                details={"applied": apply, "applied_count": 0, "relationship_count": 0},
+            )
             return {
                 "project_id": project_id,
                 "source": "heuristic",
@@ -1472,6 +1542,12 @@ async def infer_project_relations(project_id: str, apply: bool = True):
                 )
                 applied_count += 1
 
+        log_request_activity(
+            request,
+            "infer_relations",
+            project_id=project_id,
+            details={"applied": apply, "applied_count": applied_count, "relationship_count": len(relationships)},
+        )
         return {
             "project_id": project_id,
             "source": inference.get("source"),
@@ -1489,7 +1565,7 @@ async def infer_project_relations(project_id: str, apply: bool = True):
         conn.close()
 
 @app.post("/project/{project_id}/relations/update")
-async def update_project_relations(project_id: str, payload = Body(...)):
+async def update_project_relations(project_id: str, request: Request, payload = Body(...)):
     if isinstance(payload, dict):
         relations = payload.get("relations", [])
     elif isinstance(payload, list):
@@ -1543,6 +1619,12 @@ async def update_project_relations(project_id: str, payload = Body(...)):
             )
             applied_count += 1
 
+        log_request_activity(
+            request,
+            "update_relations",
+            project_id=project_id,
+            details={"updated_count": applied_count},
+        )
         return {"message": "Relations updated", "updated_count": applied_count}
     except HTTPException:
         raise
@@ -1552,7 +1634,7 @@ async def update_project_relations(project_id: str, payload = Body(...)):
         conn.close()
 
 @app.post("/project/{project_id}/add-table")
-async def add_table(project_id: str, file: UploadFile = File(...)):
+async def add_table(project_id: str, request: Request, file: UploadFile = File(...)):
     if not file.filename.endswith('.csv'):
         raise HTTPException(status_code=400, detail="Only CSV files are allowed")
     
@@ -1577,13 +1659,20 @@ async def add_table(project_id: str, file: UploadFile = File(...)):
             conn.execute("INSERT INTO column_profiles (id, column_id, null_count, min_val, max_val, cardinality, sd, variance, null_value_percent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                          (str(uuid.uuid4()), col_id, col["nulls"], col["min"], col["max"], col["cardinality"], col.get("sd"), col.get("variance"), col.get("null_value_percent")))
         conn.close()
+        log_request_activity(
+            request,
+            "add_table",
+            project_id=project_id,
+            table_id=table_id,
+            details={"filename": file.filename, "row_count": stats["total_rows"]},
+        )
         return {"table_id": table_id, "stats": stats}
     except Exception as e:
         if os.path.exists(file_path): os.remove(file_path)
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/project/{project_id}/tables/{table_id}")
-async def delete_table(project_id: str, table_id: str):
+async def delete_table(project_id: str, table_id: str, request: Request):
     conn = get_db_connection()
     try:
         table_rows = conn.execute(
@@ -1638,6 +1727,13 @@ async def delete_table(project_id: str, table_id: str):
             conn.execute("DELETE FROM projects WHERE id = CAST(? AS UUID)", (project_id,))
             project_deleted = True
 
+        log_request_activity(
+            request,
+            "delete_table",
+            project_id=project_id,
+            table_id=table_id,
+            details={"project_deleted": project_deleted, "remaining_tables": int(remaining_tables), "table_name": table_name},
+        )
         return {
             "project_id": project_id,
             "table_id": table_id,
@@ -1652,7 +1748,7 @@ async def delete_table(project_id: str, table_id: str):
         conn.close()
 
 @app.delete("/project/{project_id}")
-async def delete_project(project_id: str):
+async def delete_project(project_id: str, request: Request):
     conn = get_db_connection()
     try:
         project_rows = conn.execute(
@@ -1702,6 +1798,12 @@ async def delete_project(project_id: str):
                 except Exception:
                     pass
 
+        log_request_activity(
+            request,
+            "delete_project",
+            project_id=project_id,
+            details={"deleted_tables": len(table_rows), "deleted_files": deleted_files},
+        )
         return {
             "project_id": project_id,
             "deleted_tables": len(table_rows),
@@ -1739,7 +1841,13 @@ def run_generation_task(
     knn_neighbors: int = 5,
 ):
     start_time = time.time()
-    tasks[task_id] = {"status": "running", "progress": 0, "logs": [f"Starting generation for project {project_id}..."], "file_path": None}
+    tasks[task_id] = {
+        "status": "running",
+        "progress": 0,
+        "logs": [f"Starting generation for project {project_id}..."],
+        "file_path": None,
+        "project_id": project_id,
+    }
     try:
         generation_params = {
             "stddev_scale": float(stddev_scale),
@@ -2028,6 +2136,7 @@ def run_generation_task(
 @app.get("/generate/{project_id}")
 async def generate_dispatch(
     project_id: str,
+    request: Request,
     background_tasks: BackgroundTasks,
     num_rows: float = 100,
     seed: int = 42,
@@ -2045,6 +2154,17 @@ async def generate_dispatch(
         table_settings = json.loads(table_settings_json) if str(table_settings_json or "").strip() else {}
     except Exception:
         table_settings = {}
+    log_request_activity(
+        request,
+        "generate_requested",
+        project_id=project_id,
+        details={
+            "num_rows": rows_int,
+            "seed": seed,
+            "format": format,
+            "table_setting_count": len(table_settings) if isinstance(table_settings, dict) else 0,
+        },
+    )
     background_tasks.add_task(
         run_generation_task,
         task_id,
@@ -2067,12 +2187,18 @@ async def get_task_status(task_id: str):
     return tasks[task_id]
 
 @app.get("/task/{task_id}/download")
-async def download_task_file(task_id: str):
+async def download_task_file(task_id: str, request: Request):
     if task_id not in tasks or tasks[task_id]["status"] != "done":
         raise HTTPException(status_code=404, detail="File not ready or task failed")
     file_path = tasks[task_id]["file_path"]
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found on disk")
+    log_request_activity(
+        request,
+        "download_output",
+        project_id=tasks[task_id].get("project_id"),
+        details={"task_id": task_id, "filename": os.path.basename(file_path)},
+    )
     
     filename = os.path.basename(file_path)
     

@@ -1,0 +1,4 @@
+Traceback (most recent call last):
+  File "C:\Users\abhinav.pandey.ASCENDION\Data_Cosmos\frontend\main.py", line 10, in <module>
+    from nicegui import app, events, run as nicegui_run, ui
+ModuleNotFoundError: No module named 'nicegui'

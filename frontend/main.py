@@ -8,6 +8,14 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 from nicegui import app, events, run as nicegui_run, ui
+from auth import (
+    build_auth_headers,
+    clear_auth_state,
+    get_auth_token,
+    get_auth_user,
+    is_authenticated,
+    set_auth_state,
+)
 
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
 
@@ -228,6 +236,44 @@ ui.add_head_html(
         color: var(--nexus-brand);
         font-weight: 700;
       }
+      .admin-workflow-card {
+        min-height: 100%;
+      }
+      .admin-step-chip {
+        border: 1px solid #bfdbfe;
+        background: #eff6ff;
+        color: #1d4ed8;
+        border-radius: 9999px;
+        font-size: 0.72rem;
+        font-weight: 800;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        padding: 0.22rem 0.62rem;
+      }
+      .admin-user-card {
+        border: 1px solid #dbe7f2;
+        background: rgba(255, 255, 255, 0.76);
+        border-radius: 14px;
+      }
+      .admin-user-meta {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 0.9rem;
+      }
+      .admin-meta-label {
+        font-size: 0.72rem;
+        font-weight: 800;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        color: #64748b;
+      }
+      .admin-meta-value {
+        font-size: 0.95rem;
+        color: #334155;
+      }
+      .admin-actions {
+        border-top: 1px solid #e2e8f0;
+      }
       .q-tooltip {
         white-space: nowrap !important;
       }
@@ -254,6 +300,9 @@ ui.add_head_html(
         .assistant-scroll {
           max-height: calc(100vh - 16rem);
         }
+        .admin-user-meta {
+          grid-template-columns: 1fr;
+        }
       }
       @keyframes fadeUp {
         from { opacity: 0; transform: translateY(8px); }
@@ -268,6 +317,24 @@ ui.add_head_html(
 @ui.page("/")
 async def main_page() -> None:
     client = ui.context.client
+    stored_auth_token = get_auth_token(app.storage.user)
+    stored_auth_user = get_auth_user(app.storage.user)
+    if stored_auth_token:
+        try:
+            async with httpx.AsyncClient(timeout=10.0, headers=build_auth_headers(stored_auth_token)) as auth_client:
+                me_resp = await auth_client.get(f"{BACKEND_URL}/auth/me")
+            if me_resp.is_success:
+                stored_auth_user = (me_resp.json() or {}).get("user") or stored_auth_user
+                if stored_auth_user:
+                    set_auth_state(app.storage.user, stored_auth_token, stored_auth_user)
+            else:
+                clear_auth_state(app.storage.user)
+                stored_auth_token = ""
+                stored_auth_user = None
+        except Exception:
+            clear_auth_state(app.storage.user)
+            stored_auth_token = ""
+            stored_auth_user = None
 
     class APIError(Exception):
         def __init__(self, status_code: int, detail: Any):
@@ -345,6 +412,23 @@ async def main_page() -> None:
         "assistant_fresh_start": False,
         "recent_csv_uploads": {},
         "pending_download_url": None,
+        "auth_token": stored_auth_token,
+        "auth_user": stored_auth_user,
+        "login_username": stored_auth_user.get("username", "") if isinstance(stored_auth_user, dict) else "",
+        "login_password": "",
+        "login_error": "",
+        "auth_busy": False,
+        "admin_loading": False,
+        "admin_search": "",
+        "admin_users": [],
+        "admin_audit": [],
+        "admin_activity": [],
+        "admin_create_username": "",
+        "admin_create_password": "",
+        "admin_create_confirm_password": "",
+        "admin_create_role": "user",
+        "admin_create_active": True,
+        "profile_menu_open": False,
     }
     SCHEMA_TYPE_OPTIONS = [
         "varchar",
@@ -398,6 +482,225 @@ async def main_page() -> None:
         except Exception:
             print(f"[notify:{notify_type}] {message}")
 
+    def auth_headers() -> Dict[str, str]:
+        return build_auth_headers(local_state.get("auth_token") or "")
+
+    def api_client(timeout: float) -> httpx.AsyncClient:
+        return httpx.AsyncClient(timeout=timeout, headers=auth_headers())
+
+    def auth_user() -> Dict[str, Any]:
+        user = local_state.get("auth_user")
+        return user if isinstance(user, dict) else {}
+
+    def is_admin_user() -> bool:
+        return str(auth_user().get("role") or "").strip().lower() == "admin"
+
+    def format_timestamp(value: Any) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return "Never"
+        text = text.replace("T", " ")
+        return text[:19]
+
+    def clear_login_session(*, notify: bool = False) -> None:
+        clear_auth_state(app.storage.user)
+        local_state["auth_token"] = ""
+        local_state["auth_user"] = None
+        local_state["profile_menu_open"] = False
+        local_state["login_password"] = ""
+        local_state["auth_busy"] = False
+        local_state["login_error"] = ""
+        local_state["page"] = "upload"
+        if notify:
+            safe_notify("Your session has expired. Please sign in again.", notify_type="warning")
+
+    def close_profile_menu() -> None:
+        if local_state.get("profile_menu_open"):
+            local_state["profile_menu_open"] = False
+            safe_refresh(nav_bar)
+
+    def toggle_profile_menu() -> None:
+        local_state["profile_menu_open"] = not bool(local_state.get("profile_menu_open"))
+        safe_refresh(nav_bar)
+
+    async def submit_login() -> None:
+        username = str(local_state.get("login_username") or "").strip()
+        password = str(local_state.get("login_password") or "")
+        if not username or not password:
+            local_state["login_error"] = "Enter username and password."
+            safe_refresh(login_view)
+            return
+
+        local_state["auth_busy"] = True
+        local_state["login_error"] = ""
+        safe_refresh(login_view)
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as login_client:
+                resp = await login_client.post(
+                    f"{BACKEND_URL}/auth/login",
+                    json={"username": username, "password": password},
+                )
+            data = await parse_response(resp)
+            token = str(data.get("token") or "").strip()
+            user = data.get("user") or {"username": username}
+            if not token:
+                raise APIError(500, "Login response did not include a token")
+            set_auth_state(app.storage.user, token, user)
+            local_state["auth_token"] = token
+            local_state["auth_user"] = dict(user)
+            local_state["login_password"] = ""
+            safe_notify("Signed in successfully.", notify_type="positive")
+            client.run_javascript("window.location.reload()")
+        except Exception as ex:
+            local_state["login_error"] = str(ex)
+            safe_notify(f"Login failed: {ex}", notify_type="negative")
+        finally:
+            local_state["auth_busy"] = False
+            safe_refresh(login_view)
+
+    async def submit_logout() -> None:
+        try:
+            async with httpx.AsyncClient(timeout=10.0, headers=auth_headers()) as logout_client:
+                await logout_client.post(f"{BACKEND_URL}/auth/logout")
+        except Exception:
+            pass
+        clear_login_session()
+        safe_notify("Signed out.", notify_type="positive")
+        client.run_javascript("window.location.reload()")
+
+    async def load_admin_data() -> None:
+        if not is_admin_user() or local_state.get("admin_loading"):
+            return
+        local_state["admin_loading"] = True
+        safe_refresh(admin_view)
+        try:
+            async with api_client(timeout=20.0) as client_api:
+                users_resp = await client_api.get(f"{BACKEND_URL}/auth/admin/users")
+                audit_resp = await client_api.get(f"{BACKEND_URL}/auth/admin/audit", params={"limit": 8})
+                activity_resp = await client_api.get(f"{BACKEND_URL}/auth/admin/activity", params={"limit": 20})
+            user_payload = await parse_response(users_resp)
+            audit_payload = await parse_response(audit_resp)
+            activity_payload = await parse_response(activity_resp)
+            local_state["admin_users"] = list(user_payload.get("users") or [])
+            local_state["admin_audit"] = list(audit_payload.get("items") or [])
+            local_state["admin_activity"] = list(activity_payload.get("items") or [])
+        except Exception as ex:
+            safe_notify(f"Admin data load failed: {ex}", notify_type="negative")
+        finally:
+            local_state["admin_loading"] = False
+            safe_refresh(admin_view)
+            safe_refresh(nav_bar)
+
+    def clear_admin_create_form(*, refresh: bool = True) -> None:
+        local_state["admin_create_username"] = ""
+        local_state["admin_create_password"] = ""
+        local_state["admin_create_confirm_password"] = ""
+        local_state["admin_create_role"] = "user"
+        local_state["admin_create_active"] = True
+        if refresh:
+            safe_refresh(admin_view)
+
+    def validate_password_rule(password: str, *, label: str = "Password") -> bool:
+        clean = str(password or "")
+        if len(clean) < 6:
+            safe_notify(f"{label} must be at least 6 characters.", notify_type="warning")
+            return False
+        return True
+
+    async def create_admin_user(dialog: Any = None) -> None:
+        username = str(local_state.get("admin_create_username") or "").strip()
+        password = str(local_state.get("admin_create_password") or "")
+        confirm_password = str(local_state.get("admin_create_confirm_password") or "")
+        role = str(local_state.get("admin_create_role") or "user")
+        is_active = bool(local_state.get("admin_create_active"))
+        if not username or not password:
+            safe_notify("Username and password are required.", notify_type="warning")
+            return
+        if not validate_password_rule(password):
+            return
+        if password != confirm_password:
+            safe_notify("Password and confirm password must match.", notify_type="warning")
+            return
+        try:
+            async with api_client(timeout=20.0) as client_api:
+                resp = await client_api.post(
+                    f"{BACKEND_URL}/auth/admin/users",
+                    json={
+                        "username": username,
+                        "password": password,
+                        "role": role,
+                        "is_active": is_active,
+                    },
+                )
+            await parse_response(resp)
+            safe_notify(f"Created user {username}.", notify_type="positive")
+            clear_admin_create_form()
+            if dialog is not None:
+                dialog.close()
+            await load_admin_data()
+        except Exception as ex:
+            safe_notify(f"Create user failed: {ex}", notify_type="negative")
+
+    async def reset_admin_user_password(username: str, password: str, confirm_password: str, dialog: Any) -> None:
+        if not password:
+            safe_notify("Enter a new password.", notify_type="warning")
+            return
+        if not validate_password_rule(password, label="New password"):
+            return
+        if password != confirm_password:
+            safe_notify("Password and confirm password must match.", notify_type="warning")
+            return
+        try:
+            async with api_client(timeout=20.0) as client_api:
+                resp = await client_api.post(
+                    f"{BACKEND_URL}/auth/admin/users/{username}/reset-password",
+                    json={"password": password},
+                )
+            await parse_response(resp)
+            dialog.close()
+            safe_notify(f"Password reset for {username}.", notify_type="positive")
+            await load_admin_data()
+        except Exception as ex:
+            safe_notify(f"Password reset failed: {ex}", notify_type="negative")
+
+    async def update_admin_user_role(username: str, role: str, dialog: Any) -> None:
+        try:
+            async with api_client(timeout=20.0) as client_api:
+                resp = await client_api.post(
+                    f"{BACKEND_URL}/auth/admin/users/{username}/role",
+                    json={"role": role},
+                )
+            await parse_response(resp)
+            dialog.close()
+            safe_notify(f"Updated role for {username}.", notify_type="positive")
+            await load_admin_data()
+        except Exception as ex:
+            safe_notify(f"Role change failed: {ex}", notify_type="negative")
+
+    async def update_admin_user_status(username: str, is_active: bool) -> None:
+        try:
+            async with api_client(timeout=20.0) as client_api:
+                resp = await client_api.post(
+                    f"{BACKEND_URL}/auth/admin/users/{username}/status",
+                    json={"is_active": is_active},
+                )
+            await parse_response(resp)
+            safe_notify(f"{'Activated' if is_active else 'Deactivated'} {username}.", notify_type="positive")
+            await load_admin_data()
+        except Exception as ex:
+            safe_notify(f"Status update failed: {ex}", notify_type="negative")
+
+    async def delete_admin_user(username: str, dialog: Any) -> None:
+        try:
+            async with api_client(timeout=20.0) as client_api:
+                resp = await client_api.delete(f"{BACKEND_URL}/auth/admin/users/{username}")
+            await parse_response(resp)
+            dialog.close()
+            safe_notify(f"Deleted user {username}.", notify_type="positive")
+            await load_admin_data()
+        except Exception as ex:
+            safe_notify(f"Delete user failed: {ex}", notify_type="negative")
+
     def download_file(url: str, *, notify: bool = True) -> bool:
         """Download a file from URL using browser's download mechanism."""
         if not url:
@@ -407,6 +710,8 @@ async def main_page() -> None:
         
         try:
             print(f"[download] Browser-accessible URL: {url}")
+            token = str(local_state.get("auth_token") or "").strip()
+            auth_header = json.dumps(f"Bearer {token}") if token else "null"
 
             js = f"""
                 (async () => {{
@@ -415,9 +720,12 @@ async def main_page() -> None:
                         
                         // Try fetch first to handle CORS
                         try {{
+                            const authHeader = {auth_header};
+                            const headers = authHeader ? {{ Authorization: authHeader }} : {{}};
                             const response = await fetch('{url}', {{ 
                                 method: 'GET',
-                                credentials: 'same-origin'
+                                credentials: 'same-origin',
+                                headers
                             }});
                             
                             if (response.ok) {{
@@ -444,18 +752,9 @@ async def main_page() -> None:
                                 return;
                             }}
                         }} catch (fetchError) {{
-                            console.log('Fetch failed, falling back to direct link:', fetchError.message);
+                            console.log('Fetch failed:', fetchError.message);
                         }}
-                        
-                        // Fallback: Direct link click (always works for downloads)
-                        const link = document.createElement('a');
-                        link.href = '{url}';
-                        link.setAttribute('download', '');
-                        link.target = '_blank';
-                        document.body.appendChild(link);
-                        link.click();
-                        document.body.removeChild(link);
-                        console.log('Download initiated via direct link');
+                        throw new Error('Authenticated download failed');
                         
                     }} catch (error) {{
                         console.error('Download error:', error);
@@ -1552,6 +1851,9 @@ async def main_page() -> None:
             if "application/json" in content_type:
                 return resp.json()
             return None
+        if resp.status_code == 401:
+            clear_login_session(notify=True)
+            safe_refresh(login_view)
         detail: Any = resp.text
         try:
             payload = resp.json()
@@ -1566,7 +1868,7 @@ async def main_page() -> None:
         local_state["is_loading_project"] = True
         refresh_all()
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with api_client(timeout=30.0) as client:
                 project_resp = await client.get(f"{BACKEND_URL}/project/{local_state['project_id']}")
                 local_state["project_data"] = await parse_response(project_resp)
                 dedupe_project_tables()
@@ -1613,7 +1915,7 @@ async def main_page() -> None:
             return
         try:
             rows = generation_base_rows()
-            async with httpx.AsyncClient(timeout=20.0) as client:
+            async with api_client(timeout=20.0) as client:
                 plan_resp = await client.get(
                     f"{BACKEND_URL}/project/{local_state['project_id']}/plan",
                     params={"base_rows": rows},
@@ -1628,7 +1930,7 @@ async def main_page() -> None:
         if not task_id:
             return
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with api_client(timeout=30.0) as client:
                 resp = await client.get(f"{BACKEND_URL}/task/{task_id}/preview", params={"rows": 5})
                 data = await parse_response(resp)
             local_state["sample_preview_tables"] = list(data.get("tables") or [])
@@ -1646,7 +1948,7 @@ async def main_page() -> None:
         local_state["is_loading_summary"] = True
         safe_refresh(project_view)
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with api_client(timeout=30.0) as client:
                 summary_resp = await client.get(f"{BACKEND_URL}/project/{local_state['project_id']}/summary")
                 local_state["project_summary"] = await parse_response(summary_resp)
             if show_notify:
@@ -1682,7 +1984,7 @@ async def main_page() -> None:
                     "message": message,
                     "history": list(local_state.get("assistant_chat") or [])[-8:],
                 }
-                async with httpx.AsyncClient(timeout=60.0) as client:
+                async with api_client(timeout=60.0) as client:
                     resp = await client.post(f"{BACKEND_URL}/assistant/chat", json=payload)
                     data = await parse_response(resp)
             if data is None:
@@ -2046,7 +2348,7 @@ async def main_page() -> None:
         local_state["is_loading_correlation"] = True
         safe_refresh(project_view)
         try:
-            async with httpx.AsyncClient(timeout=25.0) as client:
+            async with api_client(timeout=25.0) as client:
                 resp = await client.get(
                     f"{BACKEND_URL}/project/{local_state['project_id']}/tables/{table_id}/correlations",
                     params={"top_k": 30},
@@ -2079,6 +2381,17 @@ async def main_page() -> None:
             safe_refresh(project_view)
 
     def switch_page(name: str) -> None:
+        if name == "admin":
+            if not is_admin_user():
+                safe_notify("Admin access is required.", notify_type="warning")
+                return
+            local_state["page"] = "admin"
+            if not local_state.get("assistant_mode_active"):
+                local_state["assistant_page"] = "upload"
+            app.storage.user["active_page"] = "admin"
+            asyncio.create_task(load_admin_data())
+            refresh_all()
+            return
         if not stage_open(name):
             if name == "input":
                 safe_notify("Select a setup mode first.", notify_type="warning")
@@ -2101,6 +2414,7 @@ async def main_page() -> None:
         refresh_all()
 
     def refresh_all() -> None:
+        safe_refresh(login_view)
         safe_refresh(nav_bar)
         safe_refresh(upload_view)
         safe_refresh(input_view)
@@ -2108,6 +2422,7 @@ async def main_page() -> None:
         safe_refresh(modeling_view)
         safe_refresh(generate_view)
         safe_refresh(output_view)
+        safe_refresh(admin_view)
         safe_refresh(assistant_widget)
 
     async def handle_csv_upload(e: events.UploadEventArguments) -> None:
@@ -2131,7 +2446,7 @@ async def main_page() -> None:
 
             files = {"file": (e.file.name, content, "text/csv")}
             if not local_state["project_id"]:
-                async with httpx.AsyncClient(timeout=60.0) as client:
+                async with api_client(timeout=60.0) as client:
                     resp = await client.post(f"{BACKEND_URL}/upload", files=files)
                     data = await parse_response(resp)
 
@@ -2156,7 +2471,7 @@ async def main_page() -> None:
                 safe_notify("Primary CSV uploaded.", notify_type="positive")
             else:
                 active_project_id = str(local_state["project_id"])
-                async with httpx.AsyncClient(timeout=60.0) as client:
+                async with api_client(timeout=60.0) as client:
                     resp = await client.post(
                         f"{BACKEND_URL}/project/{active_project_id}/add-table",
                         files=files,
@@ -2193,7 +2508,7 @@ async def main_page() -> None:
             content = await e.file.read()
             files = {"file": (e.file.name, content, "application/sql")}
             params = {"dialect": local_state["dialect"]}
-            async with httpx.AsyncClient(timeout=60.0) as client:
+            async with api_client(timeout=60.0) as client:
                 resp = await client.post(f"{BACKEND_URL}/upload-ddl", files=files, params=params)
                 data = await parse_response(resp)
             local_state["project_id"] = data["project_id"]
@@ -2262,7 +2577,7 @@ async def main_page() -> None:
                 "project_name": str(local_state["schema_project_name"] or "").strip() or "DataCosmos",
                 "tables": normalized_tables,
             }
-            async with httpx.AsyncClient(timeout=60.0) as client:
+            async with api_client(timeout=60.0) as client:
                 resp = await client.post(f"{BACKEND_URL}/upload-schema", json=payload)
                 data = await parse_response(resp)
 
@@ -2308,7 +2623,7 @@ async def main_page() -> None:
         refresh_all()
 
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with api_client(timeout=30.0) as client:
                 resp = await client.delete(f"{BACKEND_URL}/project/{project_id}/tables/{table_id}")
                 data = await parse_response(resp)
 
@@ -2338,7 +2653,7 @@ async def main_page() -> None:
             safe_notify("No active model to clear.", notify_type="warning")
             return
         try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
+            async with api_client(timeout=60.0) as client:
                 resp = await client.delete(f"{BACKEND_URL}/project/{project_id}")
                 await parse_response(resp)
             clear_active_project_state(clear_uploaded=True)
@@ -2375,7 +2690,7 @@ async def main_page() -> None:
                 
                 config_list.append(cfg)
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with api_client(timeout=30.0) as client:
                 resp = await client.post(
                     f"{BACKEND_URL}/project/{local_state['project_id']}/config/update",
                     json={"config": config_list},
@@ -2412,7 +2727,7 @@ async def main_page() -> None:
         local_state["is_inferring_semantics"] = True
         safe_refresh(modeling_view)
         try:
-            async with httpx.AsyncClient(timeout=90.0) as client:
+            async with api_client(timeout=90.0) as client:
                 resp = await client.post(
                     f"{BACKEND_URL}/project/{local_state['project_id']}/infer-semantic-types",
                     params={"apply": True},
@@ -2460,7 +2775,7 @@ async def main_page() -> None:
         local_state["is_expanding_categories"] = True
         safe_refresh(modeling_view)
         try:
-            async with httpx.AsyncClient(timeout=90.0) as client:
+            async with api_client(timeout=90.0) as client:
                 resp = await client.post(
                     f"{BACKEND_URL}/project/{local_state['project_id']}/expand-categories",
                     params={"apply": True, "max_values": 12},
@@ -2491,7 +2806,7 @@ async def main_page() -> None:
         local_state["is_detecting_pii"] = True
         safe_refresh(modeling_view)
         try:
-            async with httpx.AsyncClient(timeout=90.0) as client:
+            async with api_client(timeout=90.0) as client:
                 resp = await client.post(
                     f"{BACKEND_URL}/project/{local_state['project_id']}/detect-pii",
                     params={"apply": True, "sample_size": 50},
@@ -2525,7 +2840,7 @@ async def main_page() -> None:
         failures = 0
         while local_state["task_status"] == "running":
             try:
-                async with httpx.AsyncClient(timeout=10.0) as client:
+                async with api_client(timeout=10.0) as client:
                     resp = await client.get(f"{BACKEND_URL}/task/{local_state['task_id']}")
                     data = await parse_response(resp)
                 local_state["task_status"] = data["status"]
@@ -2632,7 +2947,7 @@ async def main_page() -> None:
                 "knn_smoothing": float(min(1.0, max(0.0, local_state["knn_smoothing"]))),
                 "knn_neighbors": int(max(1, local_state["knn_neighbors"])),
             }
-            async with httpx.AsyncClient(timeout=60.0) as client:
+            async with api_client(timeout=60.0) as client:
                 resp = await client.get(f"{BACKEND_URL}/generate/{local_state['project_id']}", params=params)
                 data = await parse_response(resp)
             local_state["task_id"] = data["task_id"]
@@ -2658,6 +2973,7 @@ async def main_page() -> None:
             if not saved:
                 safe_notify("Please save or resolve modeling changes before leaving this step.", notify_type="warning")
                 return
+        local_state["profile_menu_open"] = False
         switch_page(name)
 
     def go_to_page(name: str) -> None:
@@ -2965,7 +3281,7 @@ async def main_page() -> None:
         local_state["is_inferring_relations"] = True
         safe_refresh(modeling_view)
         try:
-            async with httpx.AsyncClient(timeout=90.0) as client:
+            async with api_client(timeout=90.0) as client:
                 resp = await client.post(
                     f"{BACKEND_URL}/project/{local_state['project_id']}/infer-relations",
                     params={"apply": True},
@@ -2998,7 +3314,7 @@ async def main_page() -> None:
         local_state["is_saving_relations"] = True
         safe_refresh(modeling_view)
         try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
+            async with api_client(timeout=60.0) as client:
                 resp = await client.post(
                     f"{BACKEND_URL}/project/{local_state['project_id']}/relations/update",
                     json={"relations": payload_rows},
@@ -3015,21 +3331,91 @@ async def main_page() -> None:
 
     @ui.refreshable
     def nav_bar() -> None:
+        user = auth_user()
         with ui.row().classes("w-full glass-panel p-3 px-4 mb-4 items-center justify-between gap-4 fade-up"):
             with ui.column().classes("gap-0"):
-                ui.label("DataCosmos").classes("text-h5 font-extrabold").style("color: var(--nexus-brand);")
+                brand = ui.button("DataCosmos", on_click=lambda: go_to_page("upload")).props("flat no-caps")
+                brand.classes("text-h5 font-extrabold px-0 py-0 min-h-0")
+                brand.style("color: var(--nexus-brand);")
                 #ui.label("Synthetic data pipeline with relational guarantees").classes("text-xs text-slate-500")
             with ui.row().classes("flex-wrap gap-2 justify-end"):
-                for idx, step in enumerate(STEPS):
-                    classes = "stage-pill"
-                    if local_state["page"] == step["key"]:
-                        classes += " active"
-                    button = ui.button(
-                        f"{idx + 1}. {step['label']}",
-                        on_click=lambda name=step["key"]: go_to_page(name),
-                    ).props("flat no-caps")
-                    button.classes(classes)
-                    button.set_enabled(stage_open(step["key"]))
+                if local_state.get("page") != "admin":
+                    for idx, step in enumerate(STEPS):
+                        classes = "stage-pill"
+                        if local_state["page"] == step["key"]:
+                            classes += " active"
+                        button = ui.button(
+                            f"{idx + 1}. {step['label']}",
+                            on_click=lambda name=step["key"]: go_to_page(name),
+                        ).props("flat no-caps")
+                        button.classes(classes)
+                        button.set_enabled(stage_open(step["key"]))
+                if user.get("username"):
+                    if local_state.get("page") == "admin":
+                        action_button(
+                            "Back to Setup",
+                            icon="arrow_back",
+                            on_click=lambda: go_to_page("upload"),
+                            variant="outline",
+                            compact=True,
+                        )
+                    with ui.element("div").classes("inline-flex items-center"):
+                        with ui.button(icon="account_circle", on_click=toggle_profile_menu).props("round unelevated") as user_btn:
+                            user_btn.classes("assistant-choice")
+
+        if user.get("username") and local_state.get("profile_menu_open"):
+            with ui.element("div").style(
+                "position: fixed; top: 92px; right: 28px; z-index: 5000; pointer-events: auto;"
+            ):
+                with ui.card().classes("glass-panel p-4 w-[220px]").style(
+                    "position: relative; z-index: 5001;"
+                ):
+                    ui.label(str(user.get("username") or "User")).classes("text-base font-bold").style(
+                        "color: var(--nexus-brand);"
+                    )
+                    ui.label("Signed in").classes("text-xs text-slate-500 mb-2")
+                    if is_admin_user() and local_state.get("page") != "admin":
+                        action_button(
+                            "Admin Access",
+                            icon="admin_panel_settings",
+                            on_click=lambda: (close_profile_menu(), go_to_page("admin")),
+                            variant="outline",
+                            compact=True,
+                        ).classes("w-full")
+                    action_button(
+                        "Logout",
+                        icon="logout",
+                        on_click=lambda: (close_profile_menu(), asyncio.create_task(submit_logout())),
+                        variant="outline",
+                        compact=True,
+                    ).classes("w-full")
+
+    @ui.refreshable
+    def login_view() -> None:
+        if local_state.get("auth_token"):
+            return
+        with ui.column().classes("w-full max-w-md mx-auto mt-24 gap-6 fade-up"):
+            with ui.card().classes("glass-panel p-8 w-full"):
+                ui.label("Sign In To DataCosmos").classes("text-h5 font-extrabold mb-2").style("color: var(--nexus-brand);")
+                ui.label("Use your app credentials to access uploads, modeling, generation, and downloads.").classes(
+                    "text-sm text-slate-600 mb-4"
+                )
+                username = ui.input("Username").bind_value(local_state, "login_username").props("outlined")
+                username.classes("w-full")
+                password = ui.input("Password", password=True, password_toggle_button=True).bind_value(
+                    local_state, "login_password"
+                ).props("outlined")
+                password.classes("w-full")
+                password.on("keydown.enter", lambda _: asyncio.create_task(submit_login()))
+                if local_state.get("login_error"):
+                    ui.label(str(local_state.get("login_error"))).classes("text-sm text-red-500")
+                sign_in_btn = action_button(
+                    "Sign In",
+                    icon="login",
+                    on_click=lambda: asyncio.create_task(submit_login()),
+                    variant="primary",
+                )
+                sign_in_btn.set_enabled(not local_state.get("auth_busy"))
 
     @ui.refreshable
     def upload_view() -> None:
@@ -3898,6 +4284,324 @@ async def main_page() -> None:
                                         ui.label(f"> {line}").classes("text-sm mono mb-1")
 
     @ui.refreshable
+    def admin_view() -> None:
+        if local_state["page"] != "admin":
+            return
+        if not is_admin_user():
+            ui.label("Admin access required.").classes("text-slate-500")
+            return
+
+        users = list(local_state.get("admin_users") or [])
+        search_text = str(local_state.get("admin_search") or "").strip().lower()
+        visible_users = [user for user in users if not search_text or search_text in str(user.get("username") or "").lower()]
+        total_users = len(users)
+        active_users = sum(1 for user in users if user.get("is_active"))
+        admin_users = sum(1 for user in users if str(user.get("role") or "") == "admin")
+
+        def render_stat_card(label: str, value: Any, accent: str) -> None:
+            with ui.card().classes("glass-panel p-5 min-w-[180px] flex-1"):
+                ui.label(label).classes("text-xs font-bold uppercase tracking-wide text-slate-500")
+                ui.label(str(value)).classes("text-h4 font-extrabold").style(f"color: {accent};")
+
+        def format_activity_item(item: Dict[str, Any]) -> str:
+            username = str(item.get("username") or "user")
+            action = str(item.get("action") or "").replace("_", " ").strip() or "activity"
+            project_id = str(item.get("project_id") or "").strip()
+            table_id = str(item.get("table_id") or "").strip()
+            details = str(item.get("details") or "").strip()
+            created_at = format_timestamp(item.get("created_at"))
+
+            text = f"{created_at} | {username} | {action}"
+            if project_id:
+                text += f" | project {project_id[:8]}"
+            if table_id:
+                text += f" | table {table_id[:8]}"
+            if details:
+                text += f" | {details}"
+            return text
+
+        def activity_table_rows(items: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+            rows: List[Dict[str, str]] = []
+            for item in items or []:
+                rows.append(
+                    {
+                        "timestamp": format_timestamp(item.get("created_at")),
+                        "action": str(item.get("action") or "").replace("_", " ").strip() or "activity",
+                        "details": str(item.get("details") or "").strip(),
+                    }
+                )
+            return rows
+
+        def open_reset_password_dialog(username: str) -> None:
+            with ui.dialog() as dialog, ui.card().classes("glass-panel p-6 w-[420px] max-w-full"):
+                ui.label(f"Reset Password: {username}").classes("text-lg font-bold").style("color: var(--nexus-brand);")
+                new_password = ui.input("New Password", password=True, password_toggle_button=True).props("outlined")
+                new_password.classes("w-full")
+                confirm_password = ui.input("Confirm Password", password=True, password_toggle_button=True).props("outlined")
+                confirm_password.classes("w-full")
+                with ui.row().classes("w-full justify-end gap-2 mt-4"):
+                    action_button("Cancel", icon="close", on_click=dialog.close, variant="outline", compact=True)
+                    action_button(
+                        "Reset Password",
+                        icon="key",
+                        on_click=lambda: asyncio.create_task(
+                            reset_admin_user_password(username, new_password.value, confirm_password.value, dialog)
+                        ),
+                        variant="warning",
+                        compact=True,
+                    )
+            dialog.open()
+
+        def open_role_dialog(username: str, current_role: str) -> None:
+            with ui.dialog() as dialog, ui.card().classes("glass-panel p-6 w-[420px] max-w-full"):
+                ui.label(f"Change Role: {username}").classes("text-lg font-bold").style("color: var(--nexus-brand);")
+                role_select = ui.select(["admin", "user"], value=current_role, label="Role").props("outlined")
+                role_select.classes("w-full")
+                with ui.row().classes("w-full justify-end gap-2 mt-4"):
+                    action_button("Cancel", icon="close", on_click=dialog.close, variant="outline", compact=True)
+                    action_button(
+                        "Save Role",
+                        icon="manage_accounts",
+                        on_click=lambda: asyncio.create_task(update_admin_user_role(username, role_select.value, dialog)),
+                        variant="primary",
+                        compact=True,
+                    )
+            dialog.open()
+
+        def open_delete_dialog(username: str) -> None:
+            with ui.dialog() as dialog, ui.card().classes("glass-panel p-6 w-[440px] max-w-full"):
+                ui.label(f"Delete {username}?").classes("text-lg font-bold text-red-600")
+                ui.label("This permanently removes the account. Deactivation is safer if the user may need access later.").classes(
+                    "text-sm text-slate-600"
+                )
+                with ui.row().classes("w-full justify-end gap-2 mt-4"):
+                    action_button("Cancel", icon="close", on_click=dialog.close, variant="outline", compact=True)
+                    action_button(
+                        "Delete User",
+                        icon="delete",
+                        on_click=lambda: asyncio.create_task(delete_admin_user(username, dialog)),
+                        variant="danger",
+                        compact=True,
+                    )
+            dialog.open()
+
+        def open_user_logs_dialog(username: str) -> None:
+            logs_state: Dict[str, Any] = {"loading": True, "items": [], "error": ""}
+
+            @ui.refreshable
+            def render_logs() -> None:
+                if logs_state["loading"]:
+                    with ui.row().classes("items-center gap-2 text-slate-500"):
+                        ui.spinner(size="sm")
+                        ui.label("Loading recent activity...")
+                    return
+                if logs_state["error"]:
+                    ui.label(str(logs_state["error"])).classes("text-sm text-red-500")
+                    return
+                if not logs_state["items"]:
+                    ui.label("No activity recorded for this user yet.").classes("text-sm text-slate-500")
+                    return
+                ui.aggrid(
+                    {
+                        "columnDefs": [
+                            {"headerName": "Time", "field": "timestamp", "minWidth": 170, "sortable": True},
+                            {"headerName": "Action", "field": "action", "minWidth": 170, "sortable": True},
+                            {
+                                "headerName": "Details",
+                                "field": "details",
+                                "minWidth": 560,
+                                "wrapText": True,
+                                "autoHeight": True,
+                                "cellStyle": {"white-space": "normal", "line-height": "1.4"},
+                            },
+                        ],
+                        "rowData": activity_table_rows(logs_state["items"]),
+                        "defaultColDef": {"resizable": True},
+                    }
+                ).classes("w-full h-72")
+
+            async def load_user_logs() -> None:
+                try:
+                    async with api_client(timeout=20.0) as client_api:
+                        resp = await client_api.get(f"{BACKEND_URL}/auth/admin/activity/{username}", params={"limit": 50})
+                    payload = await parse_response(resp)
+                    logs_state["items"] = list(payload.get("items") or [])
+                    logs_state["error"] = ""
+                except Exception as ex:
+                    logs_state["error"] = f"Failed to load logs: {ex}"
+                    logs_state["items"] = []
+                finally:
+                    logs_state["loading"] = False
+                    render_logs.refresh()
+
+            with ui.dialog() as dialog, ui.card().classes("glass-panel p-6 w-[760px] max-w-full"):
+                ui.label(f"User Logs: {username}").classes("text-xl font-bold mb-1").style("color: var(--nexus-brand);")
+                ui.label("Recent tracked actions for this user.").classes("text-sm text-slate-500 mb-3")
+                render_logs()
+                with ui.row().classes("w-full justify-end mt-4"):
+                    action_button("Close", icon="close", on_click=dialog.close, variant="outline", compact=True)
+            asyncio.create_task(load_user_logs())
+            dialog.open()
+
+        def open_create_user_dialog() -> None:
+            clear_admin_create_form(refresh=False)
+            with ui.dialog() as dialog, ui.card().classes("glass-panel p-6 w-[520px] max-w-full"):
+                ui.label("Create User").classes("text-xl font-bold mb-1").style("color: var(--nexus-brand);")
+                ui.label("Add a new account, choose the role, and decide whether it should be active immediately.").classes(
+                    "text-sm text-slate-500 mb-3"
+                )
+                ui.label("Password rule: at least 6 characters.").classes("text-xs font-medium text-amber-700 mb-2")
+                username_input = ui.input("Username").bind_value(local_state, "admin_create_username").props("outlined")
+                username_input.classes("w-full")
+                password_input = ui.input("Password", password=True, password_toggle_button=True).bind_value(
+                    local_state, "admin_create_password"
+                ).props("outlined")
+                password_input.classes("w-full")
+                confirm_input = ui.input("Confirm Password", password=True, password_toggle_button=True).bind_value(
+                    local_state, "admin_create_confirm_password"
+                ).props("outlined")
+                confirm_input.classes("w-full")
+                role_select = ui.select(["admin", "user"], label="Role").bind_value(local_state, "admin_create_role").props("outlined")
+                role_select.classes("w-full")
+                ui.switch("Active").bind_value(local_state, "admin_create_active").classes("mt-2")
+                with ui.row().classes("w-full justify-end gap-2 mt-4"):
+                    action_button("Cancel", icon="close", on_click=dialog.close, variant="outline", compact=True)
+                    action_button(
+                        "Create User",
+                        icon="person_add",
+                        on_click=lambda: asyncio.create_task(create_admin_user(dialog)),
+                        variant="primary",
+                        compact=True,
+                    )
+            dialog.open()
+
+        render_page_header(
+            "Manage Users",
+            "Review and manage users from one place, and add a new user only when needed from the top-right action.",
+        )
+
+        with ui.column().classes("w-full gap-6 fade-up"):
+            with ui.row().classes("w-full gap-4 flex-wrap"):
+                render_stat_card("Total Users", total_users, "var(--nexus-brand)")
+                render_stat_card("Active Users", active_users, "#059669")
+                render_stat_card("Admins", admin_users, "#d97706")
+
+            with ui.row().classes("w-full items-start"):
+                with ui.card().classes("glass-panel admin-workflow-card p-6 w-full"):
+                    with ui.row().classes("w-full items-center justify-between gap-3 mb-2"):
+                        with ui.row().classes("items-center gap-2"):
+                            ui.label("Users").classes("admin-step-chip")
+                            ui.label("Review And Manage Users").classes("text-lg font-bold").style("color: var(--nexus-brand);")
+                        with ui.row().classes("items-center gap-2"):
+                            action_button(
+                                "Refresh",
+                                icon="refresh",
+                                on_click=lambda: asyncio.create_task(load_admin_data()),
+                                variant="outline",
+                                compact=True,
+                            )
+                            add_btn = ui.button(icon="person_add", on_click=open_create_user_dialog).props("round unelevated")
+                            add_btn.classes("assistant-choice")
+                            attach_tooltip(add_btn, "Add user")
+                    ui.label("Search for a user, review their status, then use the actions under that user card.").classes(
+                        "text-sm text-slate-500 mb-4"
+                    )
+                    search_input = ui.input("Search username...").bind_value(local_state, "admin_search").props("outlined clearable")
+                    search_input.classes("w-full max-w-sm")
+                    search_input.on("keydown.enter", lambda _: safe_refresh(admin_view))
+                    search_input.on("blur", lambda _: safe_refresh(admin_view))
+                    with ui.column().classes("w-full mt-4"):
+                        if local_state.get("admin_loading") and not users:
+                            ui.label("Loading users...").classes("text-sm text-slate-500 py-3")
+                        elif not visible_users:
+                            ui.label("No users match the current search.").classes("text-sm text-slate-500 py-3")
+                        for user in visible_users:
+                            username = str(user.get("username") or "")
+                            role = str(user.get("role") or "user")
+                            is_active = bool(user.get("is_active"))
+                            is_self = username.lower() == str(auth_user().get("username") or "").lower()
+                            title = f"{username} {'• admin' if role == 'admin' else '• user'} {'• active' if is_active else '• inactive'}"
+                            with ui.expansion(title, value=False).classes("admin-user-card w-full p-2 mb-3"):
+                                with ui.column().classes("p-3 gap-3"):
+                                    with ui.row().classes("w-full gap-2 flex-wrap"):
+                                        ui.label(role.title()).classes("setup-chip")
+                                        ui.label("Active" if is_active else "Inactive").classes(
+                                            "setup-chip"
+                                        ).style(
+                                            "background: #ecfdf5; color: #047857; border-color: #a7f3d0;"
+                                            if is_active
+                                            else "background: #fff1f2; color: #be123c; border-color: #fecdd3;"
+                                        )
+                                        if is_self:
+                                            ui.label("Current session").classes("setup-chip")
+
+                                    ui.label("Use the actions below to update this account.").classes("text-sm text-slate-500")
+
+                                    with ui.row().classes("admin-user-meta w-full mt-1"):
+                                        with ui.column().classes("gap-1"):
+                                            ui.label("Created On").classes("admin-meta-label")
+                                            ui.label(format_timestamp(user.get("created_at"))).classes("admin-meta-value")
+                                        with ui.column().classes("gap-1"):
+                                            ui.label("Last Login").classes("admin-meta-label")
+                                            ui.label(format_timestamp(user.get("last_login_at"))).classes("admin-meta-value")
+
+                                    with ui.row().classes("admin-actions w-full gap-2 flex-wrap justify-start mt-2 pt-4"):
+                                        action_button(
+                                            "Reset Password",
+                                            icon="key",
+                                            on_click=lambda name=username: open_reset_password_dialog(name),
+                                            variant="outline",
+                                            compact=True,
+                                        )
+                                        action_button(
+                                            "Change Role",
+                                            icon="manage_accounts",
+                                            on_click=lambda name=username, current_role=role: open_role_dialog(name, current_role),
+                                            variant="outline",
+                                            compact=True,
+                                        ).set_enabled(not is_self)
+                                        action_button(
+                                            "Deactivate" if is_active else "Activate",
+                                            icon="toggle_off" if is_active else "toggle_on",
+                                            on_click=lambda name=username, next_status=not is_active: asyncio.create_task(
+                                                update_admin_user_status(name, next_status)
+                                            ),
+                                            variant="warning" if is_active else "success",
+                                            compact=True,
+                                        ).set_enabled(not is_self)
+                                        action_button(
+                                            "Delete",
+                                            icon="delete",
+                                            on_click=lambda name=username: open_delete_dialog(name),
+                                            variant="danger",
+                                            compact=True,
+                                        ).set_enabled(not is_self)
+                                        action_button(
+                                            "Logs",
+                                            icon="history",
+                                            on_click=lambda name=username: open_user_logs_dialog(name),
+                                            variant="outline",
+                                            compact=True,
+                                        )
+
+            with ui.expansion("Recent Admin Actions", value=False).classes("glass-panel p-2 w-full"):
+                with ui.column().classes("p-4 gap-2"):
+                    if not local_state.get("admin_audit"):
+                        ui.label("No admin actions recorded yet.").classes("text-sm text-slate-500")
+                    else:
+                        for item in local_state.get("admin_audit") or []:
+                            actor = str(item.get("actor_username") or "admin")
+                            action = str(item.get("action") or "").replace("_", " ")
+                            target = str(item.get("target_username") or "").strip()
+                            details = str(item.get("details") or "").strip()
+                            text = f"{actor} {action}"
+                            if target:
+                                text += f" for {target}"
+                            if details:
+                                text += f" ({details})"
+                            ui.label(f"- {text}").classes("text-sm text-slate-600")
+
+    @ui.refreshable
     def assistant_widget() -> None:
         # Keep chatbot icon/widget only on Setup page
         if str(local_state.get("page") or "") != "upload":
@@ -3993,23 +4697,28 @@ async def main_page() -> None:
                     attach_tooltip(fab, "Hi 👋 How can I help you today?")
 
 
-    if local_state["project_id"] and local_state["page"] in {"project", "modeling", "generate", "output"}:
-        asyncio.create_task(
-            load_project(
-                refresh_plan=local_state["page"] in {"generate", "output"},
-                refresh_summary=local_state["page"] == "project",
+    if local_state.get("auth_token"):
+        if local_state["project_id"] and local_state["page"] in {"project", "modeling", "generate", "output"}:
+            asyncio.create_task(
+                load_project(
+                    refresh_plan=local_state["page"] in {"generate", "output"},
+                    refresh_summary=local_state["page"] == "project",
+                )
             )
-        )
 
-    nav_bar()
-    with ui.column().classes("w-full max-w-7xl mx-auto p-4 gap-2"):
-        upload_view()
-        input_view()
-        project_view()
-        modeling_view()
-        generate_view()
-        output_view()
-    assistant_widget()
+        nav_bar()
+        with ui.column().classes("w-full max-w-7xl mx-auto p-4 gap-2"):
+            upload_view()
+            input_view()
+            project_view()
+            modeling_view()
+            generate_view()
+            output_view()
+            admin_view()
+        assistant_widget()
+    else:
+        with ui.column().classes("w-full max-w-6xl mx-auto p-4 gap-2"):
+            login_view()
 
 
 ui.run(
