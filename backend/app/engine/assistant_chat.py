@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 from dotenv import load_dotenv
+from app.engine.llm_usage import extract_usage
 
 load_dotenv()
 repo_env = Path(__file__).resolve().parents[3] / ".env"
@@ -323,6 +324,7 @@ async def infer_assistant_reply(
             )
             resp.raise_for_status()
             data = resp.json()
+        usage = extract_usage(data)
         content = _to_text(data["choices"][0]["message"]["content"]).strip()
         parsed = _safe_json_loads(content) or {}
         reply = _to_text(parsed.get("reply")).strip()
@@ -335,7 +337,7 @@ async def infer_assistant_reply(
             raise ValueError("Empty assistant reply")
         if not any(action.values()):
             action = heuristic_action
-        return {"reply": reply, "action": action, "source": "groq", "model": GROQ_MODEL}
+        return {"reply": reply, "action": action, "source": "groq", "model": GROQ_MODEL, "usage": usage}
     except Exception as ex:
         return {
             "reply": _fallback_reply(

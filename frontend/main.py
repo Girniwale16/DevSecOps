@@ -1,10 +1,12 @@
 import asyncio
+from datetime import datetime, timezone
 import hashlib
 import json
 import logging
 import os
 import re
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 import httpx
 from nicegui import app, events, run as nicegui_run, ui
@@ -18,6 +20,7 @@ from auth import (
 )
 
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
+UI_TIMEZONE = os.getenv("UI_TIMEZONE", "Asia/Kolkata")
 
 
 def _patch_nicegui_process_pool_setup() -> None:
@@ -496,11 +499,26 @@ async def main_page() -> None:
         return str(auth_user().get("role") or "").strip().lower() == "admin"
 
     def format_timestamp(value: Any) -> str:
-        text = str(value or "").strip()
-        if not text:
+        if value in (None, ""):
             return "Never"
-        text = text.replace("T", " ")
-        return text[:19]
+        try:
+            target_tz = ZoneInfo(UI_TIMEZONE)
+        except Exception:
+            target_tz = timezone.utc
+
+        try:
+            if isinstance(value, (int, float)) or (str(value).strip().isdigit() and len(str(value).strip()) >= 10):
+                dt = datetime.fromtimestamp(float(value), tz=timezone.utc)
+            else:
+                text = str(value).strip()
+                normalized = text.replace("Z", "+00:00")
+                dt = datetime.fromisoformat(normalized)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(target_tz).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            text = str(value or "").strip().replace("T", " ")
+            return text[:19] if text else "Never"
 
     def clear_login_session(*, notify: bool = False) -> None:
         clear_auth_state(app.storage.user)
@@ -4323,11 +4341,25 @@ async def main_page() -> None:
         def activity_table_rows(items: List[Dict[str, Any]]) -> List[Dict[str, str]]:
             rows: List[Dict[str, str]] = []
             for item in items or []:
+                raw_details = item.get("details")
+                total_tokens = ""
+                details_text = str(raw_details or "").strip()
+                if isinstance(raw_details, str) and raw_details.strip().startswith("{"):
+                    try:
+                        parsed_details = json.loads(raw_details)
+                    except Exception:
+                        parsed_details = None
+                    if isinstance(parsed_details, dict):
+                        token_value = parsed_details.pop("total_tokens", None)
+                        if token_value not in (None, ""):
+                            total_tokens = str(token_value)
+                        details_text = json.dumps(parsed_details, ensure_ascii=True, sort_keys=True) if parsed_details else ""
                 rows.append(
                     {
                         "timestamp": format_timestamp(item.get("created_at")),
                         "action": str(item.get("action") or "").replace("_", " ").strip() or "activity",
-                        "details": str(item.get("details") or "").strip(),
+                        "total_tokens": total_tokens,
+                        "details": details_text,
                     }
                 )
             return rows
@@ -4406,10 +4438,11 @@ async def main_page() -> None:
                         "columnDefs": [
                             {"headerName": "Time", "field": "timestamp", "minWidth": 170, "sortable": True},
                             {"headerName": "Action", "field": "action", "minWidth": 170, "sortable": True},
+                            {"headerName": "Total Tokens", "field": "total_tokens", "minWidth": 130, "sortable": True},
                             {
                                 "headerName": "Details",
                                 "field": "details",
-                                "minWidth": 560,
+                                "minWidth": 430,
                                 "wrapText": True,
                                 "autoHeight": True,
                                 "cellStyle": {"white-space": "normal", "line-height": "1.4"},
@@ -4434,7 +4467,7 @@ async def main_page() -> None:
                     logs_state["loading"] = False
                     render_logs.refresh()
 
-            with ui.dialog() as dialog, ui.card().classes("glass-panel p-6 w-[760px] max-w-full"):
+            with ui.dialog() as dialog, ui.card().classes("glass-panel p-6 w-[900px] max-w-full"):
                 ui.label(f"User Logs: {username}").classes("text-xl font-bold mb-1").style("color: var(--nexus-brand);")
                 ui.label("Recent tracked actions for this user.").classes("text-sm text-slate-500 mb-3")
                 render_logs()

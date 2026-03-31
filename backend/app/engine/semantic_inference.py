@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 from dotenv import load_dotenv
+from app.engine.llm_usage import extract_usage
 
 load_dotenv()
 repo_env = Path(__file__).resolve().parents[3] / ".env"
@@ -218,6 +219,7 @@ async def infer_column_semantics(columns: List[Dict[str, Any]]) -> Dict[str, Any
             )
             resp.raise_for_status()
             data = resp.json()
+        usage = extract_usage(data)
     except Exception as ex:
         return {
             "source": "heuristic",
@@ -284,5 +286,6 @@ async def infer_column_semantics(columns: List[Dict[str, Any]]) -> Dict[str, Any
     return {
         "source": "groq",
         "model": GROQ_MODEL,
+        "usage": usage,
         "suggestions": final_suggestions,
     }

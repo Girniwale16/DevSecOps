@@ -83,6 +83,14 @@ def _verify_password(password: str, salt: str, password_hash: str) -> bool:
     return secrets.compare_digest(computed_hash, str(password_hash or ""))
 
 
+def _token_reference(token: Optional[str]) -> Optional[str]:
+    clean = str(token or "").strip()
+    if not clean:
+        return None
+    digest = hashlib.sha256(clean.encode("utf-8")).hexdigest()
+    return digest[:10]
+
+
 def init_auth_storage() -> None:
     conn = get_db_connection()
     conn.execute(
@@ -207,6 +215,22 @@ def _stringify_details(details: Any) -> Optional[str]:
     except Exception:
         clean = str(details).strip()
         return clean or None
+
+
+def _details_with_token_ref(details: Any, token: Optional[str]) -> Any:
+    token_ref = _token_reference(token)
+    if not token_ref:
+        return details
+    if details is None:
+        return {"token_ref": token_ref}
+    if isinstance(details, dict):
+        merged = dict(details)
+        merged.setdefault("token_ref", token_ref)
+        return merged
+    clean = str(details).strip()
+    if not clean:
+        return {"token_ref": token_ref}
+    return {"message": clean, "token_ref": token_ref}
 
 
 def write_user_activity(
@@ -401,7 +425,7 @@ async def login(payload: Dict[str, Any] = Body(default={})):
         "last_login_at": login_epoch,
         "login_at": login_epoch,
     }
-    write_user_activity(db_username, "login", details={"role": role})
+    write_user_activity(db_username, "login", details=_details_with_token_ref({"role": role}, token))
     return {"token": token, "user": user}
 
 
@@ -426,7 +450,7 @@ async def logout(authorization: Optional[str] = Header(default=None)):
                 (username,),
             )
             conn.close()
-            write_user_activity(username, "logout")
+            write_user_activity(username, "logout", details=_details_with_token_ref(None, token))
     return {"ok": True}
 
 

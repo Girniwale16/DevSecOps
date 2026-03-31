@@ -4,6 +4,7 @@ from typing import Any, Dict, List
 
 import httpx
 from dotenv import load_dotenv
+from app.engine.llm_usage import extract_usage
 
 load_dotenv()
 repo_env = Path(__file__).resolve().parents[3] / ".env"
@@ -120,6 +121,7 @@ async def infer_project_summary(
             )
             resp.raise_for_status()
             data = resp.json()
+        usage = extract_usage(data)
 
         summary = _to_text(data["choices"][0]["message"]["content"]).strip()
         if not summary:
@@ -129,7 +131,7 @@ async def infer_project_summary(
         if len(summary) > 280:
             summary = summary[:277].rstrip() + "..."
 
-        return {"summary": summary, "source": "groq", "model": GROQ_MODEL}
+        return {"summary": summary, "source": "groq", "model": GROQ_MODEL, "usage": usage}
     except Exception as ex:
         return {
             "summary": _fallback_summary(project, tables, relations),

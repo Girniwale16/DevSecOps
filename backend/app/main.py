@@ -28,6 +28,7 @@ from app.engine.relationship_inference import infer_table_relationships
 from app.engine.category_expansion import expand_categorical_column, parse_allowed_values
 from app.engine.association_inference import infer_column_associations
 from app.engine.assistant_chat import infer_assistant_reply
+from app.engine.llm_usage import sum_usage
 from app.auth import current_user_from_request, init_auth_storage, is_public_path, log_request_activity, router as auth_router
 import pandas as pd
 import numpy as np
@@ -35,6 +36,18 @@ import numpy as np
 def safe_df_to_dict(df):
     """Replaces NaN/Inf with None so it's JSON compliant."""
     return df.replace({np.nan: None, np.inf: None, -np.inf: None}).to_dict('records')
+
+
+def _usage_details(usage: Optional[Dict[str, Any]]) -> Dict[str, int]:
+    if not isinstance(usage, dict):
+        return {}
+    value = usage.get("total_tokens")
+    if value is None:
+        return {}
+    try:
+        return {"total_tokens": int(value)}
+    except Exception:
+        return {}
 
 
 def _normalize_table_generation_settings(
@@ -855,7 +868,7 @@ async def get_project(project_id: str):
 
 
 @app.get("/project/{project_id}/tables/{table_id}/correlations")
-async def get_table_correlations(project_id: str, table_id: str, top_k: int = 30):
+async def get_table_correlations(project_id: str, table_id: str, request: Request, top_k: int = 30):
     conn = get_db_connection()
     try:
         table_rows = safe_df_to_dict(
@@ -942,6 +955,7 @@ async def get_table_correlations(project_id: str, table_id: str, top_k: int = 30
         llm_note = None
         llm_source = None
         llm_model = None
+        llm_usage = None
         try:
             sample_df = df.head(500)
             columns_payload = []
@@ -968,10 +982,24 @@ async def get_table_correlations(project_id: str, table_id: str, top_k: int = 30
             llm_rows = llm_resp.get("associations", [])
             llm_source = llm_resp.get("source")
             llm_model = llm_resp.get("model")
+            llm_usage = llm_resp.get("usage")
             if llm_resp.get("error"):
                 llm_note = llm_resp.get("error")
         except Exception as exc:
             llm_note = f"LLM association failed: {exc}"
+
+        log_request_activity(
+            request,
+            "infer_associations",
+            project_id=project_id,
+            table_id=table_id,
+            details={
+                "correlation_count": len(corr_rows),
+                "association_count": len(assoc_rows),
+                "llm_association_count": len(llm_rows),
+                **_usage_details(llm_usage),
+            },
+        )
 
         return {
             "table_id": table_id,
@@ -983,13 +1011,14 @@ async def get_table_correlations(project_id: str, table_id: str, top_k: int = 30
             "llm_note": llm_note,
             "llm_source": llm_source,
             "llm_model": llm_model,
+            "llm_usage": llm_usage,
         }
     finally:
         conn.close()
 
 
 @app.get("/project/{project_id}/summary")
-async def get_project_natural_summary(project_id: str):
+async def get_project_natural_summary(project_id: str, request: Request):
     conn = get_db_connection()
     try:
         project_rows = safe_df_to_dict(conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).df())
@@ -1020,6 +1049,12 @@ async def get_project_natural_summary(project_id: str):
             jsonable_encoder(tables),
             jsonable_encoder(relations),
         )
+        log_request_activity(
+            request,
+            "refresh_summary",
+            project_id=project_id,
+            details=_usage_details(summary.get("usage")),
+        )
 
         return jsonable_encoder(
             {
@@ -1028,6 +1063,7 @@ async def get_project_natural_summary(project_id: str):
                 "source": summary.get("source"),
                 "model": summary.get("model"),
                 "error": summary.get("error"),
+                "usage": summary.get("usage"),
             }
         )
     finally:
@@ -1086,7 +1122,12 @@ async def assistant_chat(request: Request, payload=Body(...)):
         request,
         "assistant_chat",
         project_id=project_id or None,
-        details={"page": current_page, "setup_mode": setup_mode, "message_length": len(message)},
+        details={
+            "page": current_page,
+            "setup_mode": setup_mode,
+            "message_length": len(message),
+            **_usage_details(reply.get("usage")),
+        },
     )
     return jsonable_encoder(reply)
 
@@ -1268,6 +1309,7 @@ async def infer_project_semantic_types(project_id: str, request: Request, apply:
             "source": inference.get("source"),
             "model": inference.get("model"),
             "error": inference.get("error"),
+            "usage": inference.get("usage"),
             "applied": apply,
             "applied_count": applied_count,
             "suggestions": suggestions,
@@ -1276,7 +1318,12 @@ async def infer_project_semantic_types(project_id: str, request: Request, apply:
             request,
             "infer_semantic_types",
             project_id=project_id,
-            details={"applied": apply, "applied_count": applied_count, "suggestion_count": len(suggestions)},
+            details={
+                "applied": apply,
+                "applied_count": applied_count,
+                "suggestion_count": len(suggestions),
+                **_usage_details(inference.get("usage")),
+            },
         )
         return jsonable_encoder(response_payload)
     except HTTPException:
@@ -1340,6 +1387,7 @@ async def expand_project_categories(project_id: str, request: Request, apply: bo
                     "expanded_values": expanded_str,
                     "source": expansion.get("source"),
                     "model": expansion.get("model"),
+                    "usage": expansion.get("usage"),
                     "reason": expansion.get("reason"),
                     "error": expansion.get("error"),
                 }
@@ -1360,13 +1408,20 @@ async def expand_project_categories(project_id: str, request: Request, apply: bo
             request,
             "expand_categories",
             project_id=project_id,
-            details={"applied": apply, "applied_count": applied_count, "expanded_count": len(expansions), "max_values": max_values},
+            details={
+                "applied": apply,
+                "applied_count": applied_count,
+                "expanded_count": len(expansions),
+                "max_values": max_values,
+                **_usage_details(sum_usage(expansion.get("usage") for expansion in expansions)),
+            },
         )
         return jsonable_encoder(
             {
                 "project_id": project_id,
                 "applied": apply,
                 "applied_count": applied_count,
+                "usage": sum_usage(expansion.get("usage") for expansion in expansions),
                 "expansions": expansions,
             }
         )
@@ -1546,13 +1601,19 @@ async def infer_project_relations(project_id: str, request: Request, apply: bool
             request,
             "infer_relations",
             project_id=project_id,
-            details={"applied": apply, "applied_count": applied_count, "relationship_count": len(relationships)},
+            details={
+                "applied": apply,
+                "applied_count": applied_count,
+                "relationship_count": len(relationships),
+                **_usage_details(inference.get("usage")),
+            },
         )
         return {
             "project_id": project_id,
             "source": inference.get("source"),
             "model": inference.get("model"),
             "error": inference.get("error"),
+            "usage": inference.get("usage"),
             "applied": apply,
             "applied_count": applied_count,
             "relationships": relationships,

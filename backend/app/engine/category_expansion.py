@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 from dotenv import load_dotenv
+from app.engine.llm_usage import extract_usage
 
 load_dotenv()
 repo_env = Path(__file__).resolve().parents[3] / ".env"
@@ -272,6 +273,7 @@ async def expand_categorical_column(
             )
             resp.raise_for_status()
             data = resp.json()
+        usage = extract_usage(data)
     except Exception as ex:
         return {
             "source": "local",
@@ -304,6 +306,7 @@ async def expand_categorical_column(
     return {
         "source": "groq",
         "model": GROQ_MODEL,
+        "usage": usage,
         "expanded_values": expanded,
         "reason": _to_text(parsed.get("reason") or "Expanded by model"),
     }
