@@ -203,9 +203,9 @@ def _validate_model_suggestions(
         tc = _to_text(rel.get("to_column"))
         if ft not in table_names or tt not in table_names:
             continue
-        if fc not in cols_by_table.get(ft, set()) or tc not in cols_by_table.get(tt, set()):
+        if ft == tt:
             continue
-        if ft == tt and fc == tc:
+        if fc not in cols_by_table.get(ft, set()) or tc not in cols_by_table.get(tt, set()):
             continue
         key = (ft, fc, tt, tc)
         if key in seen:

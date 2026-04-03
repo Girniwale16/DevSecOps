@@ -436,6 +436,43 @@ def _apply_generation_parameters(
     return out
 
 
+def _format_datetime_series(series: pd.Series, fmt: str) -> pd.Series:
+    parsed = pd.to_datetime(series, errors="coerce")
+    out = series.astype("object").copy()
+    valid_mask = parsed.notna()
+    if bool(valid_mask.any()):
+        out.loc[valid_mask] = parsed.loc[valid_mask].dt.strftime(fmt)
+    out.loc[~valid_mask & series.isna()] = None
+    return out
+
+
+def _apply_output_datetime_formats(
+    df: pd.DataFrame,
+    column_configs: List[Dict[str, Any]],
+    *,
+    output_format: str,
+) -> pd.DataFrame:
+    if df is None or df.empty or str(output_format or "").lower() != "csv":
+        return df
+
+    out = df.copy()
+    for cfg in column_configs or []:
+        col_name = str(cfg.get("column_name") or "")
+        if not col_name or col_name not in out.columns:
+            continue
+        dtype = str(cfg.get("data_type") or "").upper()
+        generator_type = str(cfg.get("generator_type") or "").strip().lower()
+        is_datetime = generator_type == "datetime" or any(token in dtype for token in ["DATE", "TIME", "TIMESTAMP", "DATETIME"])
+        if not is_datetime:
+            continue
+        configured_format = str(cfg.get("output_format") or "").strip()
+        if "DATE" in dtype and "TIME" not in dtype and "TIMESTAMP" not in dtype and "DATETIME" not in dtype:
+            out[col_name] = _format_datetime_series(out[col_name], configured_format or "%Y-%m-%d")
+        else:
+            out[col_name] = _format_datetime_series(out[col_name], configured_format or "%Y-%m-%d %H:%M:%S")
+    return out
+
+
 def _apply_modeling_config_to_df(
     table_name: str,
     df: pd.DataFrame,
@@ -1253,6 +1290,10 @@ async def update_project_config(project_id: str, request: Request, payload = Bod
 
     conn = get_db_connection()
     try:
+        try:
+            conn.execute("ALTER TABLE columns ADD COLUMN IF NOT EXISTS output_format VARCHAR DEFAULT ''")
+        except Exception:
+            pass
         updated_count = 0
         for col in config:
             if not isinstance(col, dict) or "id" not in col:
@@ -1270,7 +1311,7 @@ async def update_project_config(project_id: str, request: Request, payload = Bod
                 new_allowed_values_expanded = ""
             conn.execute("""
                 UPDATE columns 
-                SET is_pii = ?, generator_type = ?, data_type = ?, randomization_pct = ?, allowed_values = ?, allowed_values_expanded = ?, expand_categories = ?
+                SET is_pii = ?, generator_type = ?, data_type = ?, randomization_pct = ?, allowed_values = ?, allowed_values_expanded = ?, expand_categories = ?, output_format = ?
                 WHERE id = CAST(? AS UUID)
             """, (
                 bool(col.get("is_pii", False)),
@@ -1280,6 +1321,7 @@ async def update_project_config(project_id: str, request: Request, payload = Bod
                 new_allowed_values,
                 new_allowed_values_expanded,
                 expand_categories,
+                str(col.get("output_format") or "").strip(),
                 col_id,
             ))
             
@@ -2087,6 +2129,7 @@ def run_generation_task(
                 c.generator_type,
                 c.allowed_values,
                 c.allowed_values_expanded,
+                c.output_format,
                 c.is_pii,
                 c.randomization_pct,
                 c.expand_categories,
@@ -2174,6 +2217,11 @@ def run_generation_task(
                     key_columns=key_columns,
                     seed=table_seed,
                 )
+                synth_df = _apply_output_datetime_formats(
+                    synth_df,
+                    cfg_by_table.get(str(table["name"]), []),
+                    output_format=output_format,
+                )
                 tasks[task_id]["progress"] = 85
                 if output_format == "parquet":
                     tasks[task_id]["logs"].append("Applying modeling config and exporting Parquet...")
@@ -2242,6 +2290,11 @@ def run_generation_task(
                         column_configs=cfg_by_table.get(str(t_name), []),
                         key_columns=key_columns,
                         seed=table_seed,
+                    )
+                    synth_dict[t_name] = _apply_output_datetime_formats(
+                        synth_dict[t_name],
+                        cfg_by_table.get(str(t_name), []),
+                        output_format=output_format,
                     )
                 tasks[task_id]["progress"] = 80
 
@@ -2324,6 +2377,11 @@ def run_generation_task(
                         column_configs=cfg_by_table.get(str(t_name), []),
                         key_columns=key_columns,
                         seed=table_seed,
+                    )
+                    df = _apply_output_datetime_formats(
+                        df,
+                        cfg_by_table.get(str(t_name), []),
+                        output_format=output_format,
                     )
                     if output_format == "csv":
                         df.to_csv(tmp_file, index=False)

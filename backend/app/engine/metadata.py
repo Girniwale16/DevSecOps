@@ -84,6 +84,7 @@ def init_db():
         conn.execute("ALTER TABLE columns ADD COLUMN IF NOT EXISTS allowed_values VARCHAR DEFAULT ''")
         conn.execute("ALTER TABLE columns ADD COLUMN IF NOT EXISTS allowed_values_expanded VARCHAR DEFAULT ''")
         conn.execute("ALTER TABLE columns ADD COLUMN IF NOT EXISTS expand_categories BOOLEAN DEFAULT FALSE")
+        conn.execute("ALTER TABLE columns ADD COLUMN IF NOT EXISTS output_format VARCHAR DEFAULT ''")
     except:
         pass
 

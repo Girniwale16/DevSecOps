@@ -877,6 +877,24 @@ async def main_page() -> None:
             return _infer_generator_from_dtype(col.get("data_type") or "") == "categorical"
         return False
 
+    def _column_supports_allowed_values(col: Dict[str, Any]) -> bool:
+        generator_type = str(col.get("generator_type") or "").strip().lower()
+        dtype = str(col.get("data_type") or "").upper()
+        if generator_type == "categorical":
+            return True
+        if generator_type in {"integer", "numerical", "datetime"}:
+            return False
+        return any(token in dtype for token in ["CHAR", "TEXT", "STRING", "VARCHAR"])
+
+    def _allowed_values_tooltip(col: Dict[str, Any]) -> str:
+        dtype = str(col.get("data_type") or "").upper()
+        generator_type = str(col.get("generator_type") or "auto").strip().lower()
+        if generator_type in {"integer", "numerical"} or any(token in dtype for token in ["INT", "NUM", "DEC", "DOUBLE", "FLOAT", "REAL"]):
+            return "Numeric columns use Min and Max instead of Allowed Values."
+        if generator_type == "datetime" or any(token in dtype for token in ["DATE", "TIME", "TIMESTAMP", "DATETIME"]):
+            return "Date and time columns use Min and Max date bounds instead of Allowed Values."
+        return "Enter comma-separated seed values. Use this for categorical text columns such as department, status, or category."
+
     def sync_expand_checkbox(col: Dict[str, Any], checkbox: Any) -> None:
         enabled = supports_category_expansion(col)
         if not enabled:
@@ -1085,7 +1103,7 @@ async def main_page() -> None:
                 return [
                     {
                         "role": "assistant",
-                        "text": "Generate mode ready. Start by generating a 5-row sample download, then approve it.",
+                        "text": "Generate mode ready. Start by generating a 50-row sample download, then approve it.",
                     }
                 ]
         if page == "output":
@@ -1631,7 +1649,7 @@ async def main_page() -> None:
         if operation == "infer_semantics":
             return "Running semantic inference on your columns."
         if operation == "launch_generation_sample":
-            return "Generating a 5-row sample preview for you to review."
+            return "Generating a 50-row sample preview for you to review."
         if operation == "approve_sample":
             return "Approving the sample. You can now generate the full dataset."
         if operation == "launch_generation":
@@ -1650,7 +1668,7 @@ async def main_page() -> None:
         if target_page == "modeling":
             return "Modeling opened. Edit columns and relationships below."
         if target_page == "generate":
-            return "Generate opened. First generate a 5-row sample download, then approve it."
+            return "Generate opened. First generate a 50-row sample download, then approve it."
         if target_page == "output":
             return "Output opened. Review settings and launch full generation when ready."
         return ""
@@ -2287,6 +2305,7 @@ async def main_page() -> None:
                     else:
                         with ui.row().classes("w-full items-center justify-between gap-2 mb-2 flex-wrap"):
                             with ui.row().classes("items-center gap-2"):
+                                inline_info_icon("Use this studio to define table-to-table relationships only. AI inference excludes same-table column associations and keeps only cross-table links.")
                                 infer_rel_btn = action_button(
                                     "Infer Relationships",
                                     icon="auto_awesome",
@@ -2296,27 +2315,39 @@ async def main_page() -> None:
                                 )
                                 infer_rel_btn.set_enabled(not local_state["is_inferring_relations"])
                                 action_button("Add Relationship", icon="add_link", on_click=add_relation_row, variant="outline", compact=True)
-                            save_rel_btn = action_button("Save Relationships", icon="save", on_click=save_relationships, variant="success", compact=True)
-                            save_rel_btn.set_enabled(not local_state["is_saving_relations"])
+                            if local_state["is_saving_relations"]:
+                                with ui.row().classes("items-center gap-2 text-xs text-slate-500"):
+                                    ui.spinner(size="sm")
+                                    ui.label("Saving relationships...")
                         for r_idx, rel in enumerate(local_state.get("editable_relations", [])):
                             with ui.card().classes("w-full bg-white/80 border border-slate-200 rounded-lg p-3 shadow-none mb-2"):
                                 with ui.row().classes("w-full items-end gap-2 flex-wrap"):
-                                    ui.select(
+                                    from_table_select = ui.select(
                                         [""] + tables,
                                         label="From table",
                                         value=rel.get("from_table", ""),
                                         on_change=lambda _, i=r_idx: on_relation_table_change(i),
                                     ).bind_value(rel, "from_table").classes("w-40")
-                                    ui.select([""] + columns_for_table(rel.get("from_table", "")), label="From column").bind_value(rel, "from_column").classes("w-40")
-                                    ui.select(
+                                    attach_tooltip(from_table_select, "Child table that contains the foreign-key column.")
+                                    from_column_select = ui.select([""] + columns_for_table(rel.get("from_table", "")), label="From column").bind_value(rel, "from_column").classes("w-40")
+                                    from_column_select.on("update:model-value", lambda _, i=r_idx: queue_relationship_autosave())
+                                    attach_tooltip(from_column_select, "Foreign-key column in the child table.")
+                                    to_table_select = ui.select(
                                         [""] + tables,
                                         label="To table",
                                         value=rel.get("to_table", ""),
                                         on_change=lambda _, i=r_idx: on_relation_table_change(i),
                                     ).bind_value(rel, "to_table").classes("w-40")
-                                    ui.select([""] + columns_for_table(rel.get("to_table", "")), label="To column").bind_value(rel, "to_column").classes("w-40")
-                                    ui.select(["1:N", "1:1", "N:1", "N:N"], label="Cardinality").bind_value(rel, "cardinality").classes("w-28")
-                                    ui.checkbox("Optional").bind_value(rel, "is_optional")
+                                    attach_tooltip(to_table_select, "Parent table that is referenced by the child table.")
+                                    to_column_select = ui.select([""] + columns_for_table(rel.get("to_table", "")), label="To column").bind_value(rel, "to_column").classes("w-40")
+                                    to_column_select.on("update:model-value", lambda _, i=r_idx: queue_relationship_autosave())
+                                    attach_tooltip(to_column_select, "Referenced key column in the parent table.")
+                                    cardinality_select = ui.select(["1:N", "1:1", "N:1", "N:N"], label="Cardinality").bind_value(rel, "cardinality").classes("w-28")
+                                    cardinality_select.on("update:model-value", lambda _, i=r_idx: queue_relationship_autosave())
+                                    attach_tooltip(cardinality_select, "Relationship type between the two tables.")
+                                    optional_box = ui.checkbox("Optional").bind_value(rel, "is_optional")
+                                    optional_box.on("update:model-value", lambda _, i=r_idx: queue_relationship_autosave())
+                                    attach_tooltip(optional_box, "When enabled, child rows may exist without a parent reference.")
                                     ui.button(icon="delete", on_click=lambda _, i=r_idx: remove_relation_row(i)).props("flat dense round color=negative size=sm")
 
                     rels_for_viz = [
@@ -2373,7 +2404,7 @@ async def main_page() -> None:
                 sample_ready = bool(local_state.get("sample_confirmed"))
 
                 if not sample_generated:
-                    ui.label("Step 1: Generate a 5-row sample. It will download automatically.").classes(
+                    ui.label("Step 1: Generate a 50-row sample. It will download automatically.").classes(
                         "text-sm text-slate-500 mt-2"
                     )
                 elif not sample_ready:
@@ -2768,6 +2799,7 @@ async def main_page() -> None:
                     "allowed_values": col.get("allowed_values", "") or "",
                     "allowed_values_expanded": col.get("allowed_values_expanded", "") or "",
                     "expand_categories": bool(col.get("expand_categories", False)),
+                    "output_format": str(col.get("output_format", "") or "").strip(),
                     "randomization_pct": float(col.get("randomization_pct", 0.0) or 0.0),
                 }
                 
@@ -2979,7 +3011,7 @@ async def main_page() -> None:
             local_state["sample_confirmed"] = False
             local_state["sample_preview_tables"] = []
             local_state["sample_preview_error"] = None
-        effective_rows = 5 if sample_only else int(max(1, local_state["num_rows"] or 1))
+        effective_rows = 50 if sample_only else int(max(1, local_state["num_rows"] or 1))
         local_state["last_generation_kind"] = "sample" if sample_only else "full"
         local_state["task_status"] = "running"
         local_state["task_progress"] = 0
@@ -3015,13 +3047,13 @@ async def main_page() -> None:
                 refresh_all()
             raw_table_settings = dict(local_state.get("generation_table_settings") or {})
             if sample_only:
-                # Force true 5-row sampling per table so backend table settings cannot override the sample size.
+                # Force true 50-row sampling per table so backend table settings cannot override the sample size.
                 sample_table_settings = {}
                 for table_name in generation_table_names():
                     existing = dict(raw_table_settings.get(table_name) or {})
                     sample_table_settings[table_name] = {
                         **existing,
-                        "num_rows": 5,
+                        "num_rows": 50,
                     }
                 table_settings_payload = sample_table_settings
             else:
@@ -3061,13 +3093,16 @@ async def main_page() -> None:
         if current_page == "modeling" and name != "modeling" and local_state.get("project_data"):
             saved = await save_modeling(notify=False)
             if not saved:
-                safe_notify("Please save or resolve modeling changes before leaving this step.", notify_type="warning")
-                return
+                safe_notify("Could not save the latest modeling edits. Moving without saving.", notify_type="warning")
         local_state["profile_menu_open"] = False
         switch_page(name)
 
     def go_to_page(name: str) -> None:
-        asyncio.create_task(navigate_with_modeling_save(name))
+        if str(local_state.get("page") or "") == "modeling":
+            asyncio.create_task(navigate_with_modeling_save(name))
+        else:
+            local_state["profile_menu_open"] = False
+            switch_page(name)
 
     async def assistant_navigate_with_save(target_page: str) -> None:
         current_page = assistant_current_page()
@@ -3082,11 +3117,17 @@ async def main_page() -> None:
 
     def on_modeling_type_changed(col: Dict[str, Any], expand_box: Any) -> None:
         col["data_type"] = normalize_data_type_value(col.get("data_type"))
+        if not _column_supports_allowed_values(col):
+            col["allowed_values"] = ""
+            col["allowed_values_expanded"] = ""
         sync_expand_checkbox(col, expand_box)
         safe_refresh(modeling_view)
         safe_refresh(assistant_widget)
 
     def on_modeling_generator_changed(col: Dict[str, Any], expand_box: Any) -> None:
+        if not _column_supports_allowed_values(col):
+            col["allowed_values"] = ""
+            col["allowed_values_expanded"] = ""
         sync_expand_checkbox(col, expand_box)
         safe_refresh(modeling_view)
         safe_refresh(assistant_widget)
@@ -3154,11 +3195,11 @@ async def main_page() -> None:
                 with ui.column().classes("p-4 gap-1"):
                     for col in table.get("columns", []):
                         with ui.column().classes("w-full hover:bg-slate-50 rounded p-2 gap-1"):
-                            with ui.row().classes("w-full items-center justify-between gap-4 flex-wrap"):
-                                with ui.column().classes("gap-0 min-w-[120px]"):
+                            with ui.row().classes("w-full items-start gap-6 flex-wrap"):
+                                with ui.column().classes("gap-0 min-w-[180px] shrink-0 pt-1"):
                                     ui.label(col["name"]).classes("font-semibold text-slate-700")
                                     ui.label(col.get("data_type") or "UNKNOWN").classes("text-xs text-slate-400")
-                                with ui.row().classes("items-center gap-4 flex-wrap"):
+                                with ui.row().classes("items-start gap-4 flex-wrap flex-1 min-w-[320px]"):
                                     ui.checkbox("PII").bind_value(col, "is_pii")
                                     expand_box = ui.checkbox("Expand").bind_value(col, "expand_categories")
                                     type_select = ui.select(SCHEMA_TYPE_OPTIONS, label="Type").bind_value(col, "data_type").classes("w-36")
@@ -3169,15 +3210,25 @@ async def main_page() -> None:
                                     generator_select.on_value_change(lambda _, c=col, cb=expand_box: on_modeling_generator_changed(c, cb))
                                     type_select.on_value_change(lambda _, c=col, cb=expand_box: on_modeling_type_changed(c, cb))
                                     sync_expand_checkbox(col, expand_box)
-                                    allowed_values_input = ui.input(
-                                        "Allowed Values",
-                                        placeholder="e.g. Sales, HR, Finance or one per line",
-                                    ).bind_value(col, "allowed_values").classes(width_class)
-                                    attach_tooltip(
-                                        allowed_values_input,
-                                        "Separate allowed values with commas or new lines, for example Sales, HR, Finance.",
-                                    )
-                                    ui.label("Example: Sales, HR, Finance or one value per line.").classes("text-[11px] text-slate-400")
+                                    if _column_supports_allowed_values(col):
+                                        allowed_values_input = ui.input(
+                                            "Allowed Values",
+                                            placeholder="e.g. Sales, HR, Finance or one per line",
+                                        ).bind_value(col, "allowed_values").classes(width_class)
+                                        attach_tooltip(
+                                            allowed_values_input,
+                                            _allowed_values_tooltip(col),
+                                        )
+                                    elif _column_is_datetime(col):
+                                        with ui.column().classes("gap-1"):
+                                            output_format_input = ui.input(
+                                                "Output Format",
+                                                placeholder=_datetime_output_format_placeholder(col),
+                                            ).bind_value(col, "output_format").classes(width_class)
+                                            attach_tooltip(output_format_input, _datetime_output_format_tooltip(col))
+                                            ui.label(
+                                                f"Example: {_datetime_output_format_placeholder(col)}"
+                                            ).classes("text-[11px] text-slate-400")
 
                             with ui.row().classes("w-full items-center gap-2 mt-1 flex-wrap"):
                                 ui.number("Null %", format="%.2f").bind_value(col, "null_value_percent").classes(stat_class)
@@ -3200,8 +3251,6 @@ async def main_page() -> None:
                                     sd_input.set_enabled(False)
                                     var_input.set_enabled(False)
                                 else:
-                                    ui.input("Min").bind_value(col, "min_val").classes(stat_class)
-                                    ui.input("Max").bind_value(col, "max_val").classes(stat_class)
                                     sd_input = ui.input("Std Dev").classes(variance_class)
                                     var_input = ui.input("Variance").classes(variance_class)
                                     sd_input.set_value("" if col.get("sd") is None else str(col.get("sd")))
@@ -3273,6 +3322,18 @@ async def main_page() -> None:
         dtype = str(col.get("data_type") or "").upper()
         return col.get("generator_type") == "datetime" or any(token in dtype for token in ["DATE", "TIME", "TIMESTAMP", "DATETIME"])
 
+    def _datetime_output_format_placeholder(col: Dict[str, Any]) -> str:
+        dtype = str(col.get("data_type") or "").upper()
+        if "DATE" in dtype and "TIME" not in dtype and "TIMESTAMP" not in dtype and "DATETIME" not in dtype:
+            return "%Y-%m-%d"
+        return "%Y-%m-%d %H:%M:%S"
+
+    def _datetime_output_format_tooltip(col: Dict[str, Any]) -> str:
+        dtype = str(col.get("data_type") or "").upper()
+        if "DATE" in dtype and "TIME" not in dtype and "TIMESTAMP" not in dtype and "DATETIME" not in dtype:
+            return "CSV export format for this DATE column. Examples: %Y-%m-%d or %d/%m/%Y."
+        return "CSV export format for this TIMESTAMP/DATETIME column. Examples: %Y-%m-%d %H:%M:%S or %d/%m/%Y %H:%M."
+
     def _normalized_date_text(value: Any) -> str:
         text = str(value or "").strip()
         if len(text) >= 10 and text[4:5] == "-" and text[7:8] == "-":
@@ -3287,6 +3348,7 @@ async def main_page() -> None:
                 col["generator_type"] = str(col.get("generator_type") or "auto").strip().lower() or "auto"
                 col["allowed_values"] = str(col.get("allowed_values") or "").strip()
                 col["allowed_values_expanded"] = str(col.get("allowed_values_expanded") or "").strip()
+                col["output_format"] = str(col.get("output_format") or "").strip()
                 col["null_value_percent"] = _coerce_float(col.get("null_value_percent")) or 0.0
                 col["sd"] = _coerce_float(col.get("sd"))
                 col["variance"] = _coerce_float(col.get("variance"))
@@ -3349,11 +3411,13 @@ async def main_page() -> None:
         }
         local_state["editable_relations"].insert(0, row)
         safe_refresh(modeling_view)
+        queue_relationship_autosave()
 
     def remove_relation_row(index: int) -> None:
         if 0 <= index < len(local_state["editable_relations"]):
             local_state["editable_relations"].pop(index)
             safe_refresh(modeling_view)
+            queue_relationship_autosave()
 
     def on_relation_table_change(index: int) -> None:
         if 0 <= index < len(local_state["editable_relations"]):
@@ -3361,6 +3425,7 @@ async def main_page() -> None:
             row["from_column"] = ""
             row["to_column"] = ""
             safe_refresh(modeling_view)
+            queue_relationship_autosave()
 
     async def infer_relationships_with_ai() -> None:
         if not local_state["project_id"]:
@@ -3387,9 +3452,10 @@ async def main_page() -> None:
             local_state["is_inferring_relations"] = False
             safe_refresh(modeling_view)
 
-    async def save_relationships() -> None:
+    async def save_relationships(notify: bool = True) -> None:
         if not local_state["project_id"]:
-            safe_notify("Load a project first.", notify_type="warning")
+            if notify:
+                safe_notify("Load a project first.", notify_type="warning")
             return
         if local_state["is_saving_relations"]:
             return
@@ -3411,13 +3477,22 @@ async def main_page() -> None:
                 )
                 data = await parse_response(resp)
             updated = int(data.get("updated_count", 0))
-            safe_notify(f"Saved {updated} relationship(s).", notify_type="positive")
+            if notify:
+                safe_notify(f"Saved {updated} relationship(s).", notify_type="positive")
             await load_project(refresh_plan=False, refresh_summary=False)
         except Exception as ex:
-            safe_notify(f"Save relationships failed: {ex}", notify_type="negative")
+            if notify:
+                safe_notify(f"Save relationships failed: {ex}", notify_type="negative")
         finally:
             local_state["is_saving_relations"] = False
             safe_refresh(modeling_view)
+
+    def queue_relationship_autosave() -> None:
+        if not local_state.get("project_id"):
+            return
+        if local_state.get("is_saving_relations"):
+            return
+        asyncio.create_task(save_relationships(notify=False))
 
     @ui.refreshable
     def nav_bar() -> None:
@@ -3762,8 +3837,9 @@ async def main_page() -> None:
                                                         ).bind_value(col, "generator_type").classes("w-44")
                                                         attach_tooltip(generator_select, "Controls how synthetic values are generated. Use categorical for lists, numerical for measures, and auto when the system should infer behavior.")
                                                     with ui.row().classes("w-full items-end gap-3 flex-wrap"):
-                                                        allowed_values_input = ui.input("Allowed Values", placeholder="e.g. Sales, HR, Finance or one per line").bind_value(col, "allowed_values").classes("flex-1 min-w-[260px]")
-                                                        attach_tooltip(allowed_values_input, "Enter comma-separated seed values. For category columns, keep these broad and few, such as Accessories, Furniture, Apparel. For product columns, list concrete items such as desk, couch, sweater.")
+                                                        if _column_supports_allowed_values(col):
+                                                            allowed_values_input = ui.input("Allowed Values", placeholder="e.g. Sales, HR, Finance or one per line").bind_value(col, "allowed_values").classes("flex-1 min-w-[260px]")
+                                                            attach_tooltip(allowed_values_input, _allowed_values_tooltip(col))
                                                         description_input = ui.input("Description").bind_value(col, "description").classes("flex-1 min-w-[240px]")
                                                         attach_tooltip(description_input, "Optional note about the column meaning or how it should be generated.")
                                                     with ui.row().classes("w-full items-center gap-4 flex-wrap"):
@@ -3894,8 +3970,7 @@ async def main_page() -> None:
                             ui.separator().classes("my-3 opacity-30")
                             corr_exp = ui.expansion("Correlation (numeric columns)", value=False).classes("w-full")
                             with corr_exp:
-                                with ui.row().classes("items-center gap-2 mb-2"):
-                                    ui.label("About this section").classes("text-xs font-medium text-slate-500")
+                                with ui.row().classes("w-full justify-end mb-2"):
                                     inline_info_icon("Linear correlation between numeric columns in the selected table.")
                                 if local_state["is_loading_correlation"]:
                                     with ui.row().classes("items-center gap-2 text-slate-500"):
@@ -3921,8 +3996,7 @@ async def main_page() -> None:
                             ui.separator().classes("my-3 opacity-30")
                             assoc_exp = ui.expansion("Same-table Associations (categorical)", value=False).classes("w-full")
                             with assoc_exp:
-                                with ui.row().classes("items-center gap-2 mb-2"):
-                                    ui.label("About this section").classes("text-xs font-medium text-slate-500")
+                                with ui.row().classes("w-full justify-end mb-2"):
                                     inline_info_icon("Association strength between categorical columns in the same table.")
                                 if local_state["is_loading_correlation"]:
                                     with ui.row().classes("items-center gap-2 text-slate-500"):
@@ -3949,8 +4023,7 @@ async def main_page() -> None:
                             ui.separator().classes("my-3 opacity-30")
                             llm_assoc_exp = ui.expansion("LLM Associations (same table)", value=False).classes("w-full")
                             with llm_assoc_exp:
-                                with ui.row().classes("items-center gap-2 mb-2"):
-                                    ui.label("About this section").classes("text-xs font-medium text-slate-500")
+                                with ui.row().classes("w-full justify-end mb-2"):
                                     inline_info_icon("LLM-inferred semantic relationships between columns in the selected table.")
                                 if local_state["is_loading_correlation"]:
                                     with ui.row().classes("items-center gap-2 text-slate-500"):
@@ -4069,6 +4142,7 @@ async def main_page() -> None:
                             ui.label("Inferring relationships with AI...")
                     with ui.row().classes("w-full items-center justify-between gap-2 mb-2 flex-wrap"):
                         with ui.row().classes("items-center gap-2"):
+                            inline_info_icon("Use this studio to define table-to-table relationships only. AI inference excludes same-table column associations and keeps only cross-table links.")
                             infer_btn = action_button(
                                 "Infer Relationships (AI)",
                                 icon="auto_awesome",
@@ -4084,14 +4158,10 @@ async def main_page() -> None:
                                 variant="outline",
                                 compact=True,
                             )
-                        save_rel_btn = action_button(
-                            "Save Relationships",
-                            icon="save",
-                            on_click=save_relationships,
-                            variant="success",
-                            compact=True,
-                        )
-                        save_rel_btn.set_enabled(not local_state["is_saving_relations"])
+                        if local_state["is_saving_relations"]:
+                            with ui.row().classes("items-center gap-2 text-xs text-slate-500"):
+                                ui.spinner(size="sm")
+                                ui.label("Saving relationships...")
 
                     if not local_state["editable_relations"]:
                         ui.label("No relationships yet. Use AI inference or add manually.").classes("text-sm text-slate-500")
@@ -4099,31 +4169,41 @@ async def main_page() -> None:
                         for r_idx, rel in enumerate(local_state["editable_relations"]):
                             with ui.card().classes("bg-white/70 border border-slate-200 rounded p-3 mb-2"):
                                 with ui.row().classes("w-full items-end gap-2 flex-wrap"):
-                                    ui.select(
+                                    from_table_select = ui.select(
                                         [""] + tables,
                                         label="From table",
                                         value=rel.get("from_table", ""),
                                         on_change=lambda _, i=r_idx: on_relation_table_change(i),
                                     ).bind_value(rel, "from_table").classes("w-44")
-                                    ui.select(
+                                    attach_tooltip(from_table_select, "Child table that contains the foreign-key column.")
+                                    from_column_select = ui.select(
                                         [""] + columns_for_table(rel.get("from_table", "")),
                                         label="From column",
                                     ).bind_value(rel, "from_column").classes("w-44")
+                                    from_column_select.on("update:model-value", lambda _, i=r_idx: queue_relationship_autosave())
+                                    attach_tooltip(from_column_select, "Foreign-key column in the child table.")
                                     ui.icon("east", size="sm").classes("text-slate-400 mb-3")
-                                    ui.select(
+                                    to_table_select = ui.select(
                                         [""] + tables,
                                         label="To table",
                                         value=rel.get("to_table", ""),
                                         on_change=lambda _, i=r_idx: on_relation_table_change(i),
                                     ).bind_value(rel, "to_table").classes("w-44")
-                                    ui.select(
+                                    attach_tooltip(to_table_select, "Parent table that is referenced by the child table.")
+                                    to_column_select = ui.select(
                                         [""] + columns_for_table(rel.get("to_table", "")),
                                         label="To column",
                                     ).bind_value(rel, "to_column").classes("w-44")
-                                    ui.select(["1:N", "1:1", "N:1", "N:N"], label="Cardinality").bind_value(
+                                    to_column_select.on("update:model-value", lambda _, i=r_idx: queue_relationship_autosave())
+                                    attach_tooltip(to_column_select, "Referenced key column in the parent table.")
+                                    cardinality_select = ui.select(["1:N", "1:1", "N:1", "N:N"], label="Cardinality").bind_value(
                                         rel, "cardinality"
                                     ).classes("w-28")
-                                    ui.checkbox("Optional").bind_value(rel, "is_optional")
+                                    cardinality_select.on("update:model-value", lambda _, i=r_idx: queue_relationship_autosave())
+                                    attach_tooltip(cardinality_select, "Relationship type between the two tables.")
+                                    optional_box = ui.checkbox("Optional").bind_value(rel, "is_optional")
+                                    optional_box.on("update:model-value", lambda _, i=r_idx: queue_relationship_autosave())
+                                    attach_tooltip(optional_box, "When enabled, child rows may exist without a parent reference.")
                                     rm_rel_btn = ui.button(icon="delete").props("flat dense round color=negative size=sm")
                                     rm_rel_btn.on_click(lambda _, i=r_idx: remove_relation_row(i))
 
@@ -4251,7 +4331,7 @@ async def main_page() -> None:
 
         render_page_header(
             "Generate A Sample",
-            "Step 1 of 2: generate and download a 5-row sample, then approve it to continue to Output.",
+            "Step 1 of 2: generate and download a 50-row sample, then approve it to continue to Output.",
         )
         sample_generated = bool(local_state.get("sample_generated"))
         sample_ready = bool(local_state.get("sample_confirmed"))
@@ -4259,7 +4339,7 @@ async def main_page() -> None:
             with ui.card().classes("glass-panel p-5 w-full"):
                 ui.label("Step 1: Generate A Sample").classes("text-lg font-bold mb-2").style("color: var(--nexus-brand);")
                 ui.label(
-                    "Click below to generate a 5-row sample. The file will download automatically."
+                    "Click below to generate a 50-row sample. The file will download automatically."
                 ).classes("text-sm text-slate-500 mb-3")
                 sample_btn = action_button(
                     "Generate Sample",
@@ -4290,7 +4370,7 @@ async def main_page() -> None:
                 with ui.card().classes("glass-panel p-5 w-full"):
                     ui.label("Generation Settings").classes("text-xl font-extrabold mb-2").style("color: var(--nexus-brand);")
                     ui.label(
-                        "Approve the 5-row sample first to unlock full generation settings."
+                        "Approve the 50-row sample first to unlock full generation settings."
                     ).classes("text-sm text-slate-500")
 
         with ui.row().classes(f"{ACTION_BAR} mt-4"):
