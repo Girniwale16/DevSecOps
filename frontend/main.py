@@ -22,6 +22,8 @@ from auth import (
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
 UI_TIMEZONE = os.getenv("UI_TIMEZONE", "Asia/Kolkata")
 UPLOAD_REQUEST_TIMEOUT = float(os.getenv("UPLOAD_REQUEST_TIMEOUT", "300"))
+MAX_CSV_UPLOAD_MB = int(os.getenv("MAX_CSV_UPLOAD_MB", "50"))
+MAX_CSV_UPLOAD_BYTES = MAX_CSV_UPLOAD_MB * 1024 * 1024
 
 def _patch_nicegui_process_pool_setup() -> None:
     original_setup = nicegui_run.setup
@@ -136,7 +138,7 @@ ui.add_head_html(
       .upload-table-head,
       .upload-table-row {
         display: grid;
-        grid-template-columns: 2rem minmax(0, 3fr) 6rem 7rem 3rem;
+        grid-template-columns: 2rem minmax(0, 3.2fr) 6rem 5.5rem minmax(0, 1.8fr) 3rem;
         column-gap: 0.5rem;
         align-items: center;
       }
@@ -286,7 +288,7 @@ ui.add_head_html(
         }
         .upload-table-head,
         .upload-table-row {
-          grid-template-columns: 1.8rem minmax(0, 2.6fr) 4.8rem 5.6rem 2.4rem;
+          grid-template-columns: 1.8rem minmax(0, 2.4fr) 4.4rem 4.8rem minmax(0, 1.7fr) 2.4rem;
           column-gap: 0.35rem;
         }
         .assistant-shell {
@@ -847,10 +849,25 @@ async def main_page() -> None:
 
     def attach_tooltip(element: Any, text: str) -> Any:
         try:
-            element.tooltip(text)
+            tip = element.tooltip(text)
+            try:
+                tip.props('anchor="center left" self="center right" transition-show="jump-right" transition-hide="jump-left"')
+            except Exception:
+                pass
         except Exception:
             pass
         return element
+
+    def inline_info_icon(text: str) -> Any:
+        icon = ui.icon("info_outline").classes("text-slate-400 text-base cursor-help")
+        attach_tooltip(icon, text)
+        return icon
+
+    def notify_csv_upload_rejected(_: Any = None) -> None:
+        safe_notify(
+            f"Upload failed: file exceeded the {MAX_CSV_UPLOAD_MB} MB CSV limit.",
+            notify_type="negative",
+        )
 
     def supports_category_expansion(col: Dict[str, Any]) -> bool:
         generator_type = str(col.get("generator_type") or "").strip().lower()
@@ -1743,11 +1760,39 @@ async def main_page() -> None:
     def uploaded_success_count() -> int:
         return sum(1 for row in local_state["uploaded_tables"] if row.get("status") == "Uploaded")
 
-    def add_upload_row(file_name: str, mode: str) -> int:
+    def format_file_size(size_bytes: int) -> str:
+        try:
+            raw = int(size_bytes)
+        except Exception:
+            raw = 0
+        if raw <= 0:
+            return "0 B"
+        if raw < 1024:
+            return f"{raw} B"
+        if raw < 1024 * 1024:
+            return f"{raw / 1024:.2f} KB"
+        if raw < 1024 * 1024 * 1024:
+            return f"{raw / (1024 * 1024):.2f} MB"
+        return f"{raw / (1024 * 1024 * 1024):.2f} GB"
+
+    def uploaded_total_size_bytes() -> int:
+        total = 0
+        for row in local_state["uploaded_tables"]:
+            if str(row.get("status") or "").strip().lower() == "failed":
+                continue
+            try:
+                total += int(row.get("size_bytes") or 0)
+            except Exception:
+                continue
+        return total
+
+    def add_upload_row(file_name: str, mode: str, *, size_bytes: int = 0) -> int:
         row = {
             "no": len(local_state["uploaded_tables"]) + 1,
             "file_name": file_name,
             "mode": mode,
+            "size_bytes": int(size_bytes or 0),
+            "size_label": format_file_size(int(size_bytes or 0)),
             "status": "Uploading",
             "message": "In progress",
             "table_id": None,
@@ -2040,9 +2085,11 @@ async def main_page() -> None:
             with ui.card().classes("w-full bg-slate-50 border border-slate-200 rounded-xl p-4 shadow-none"):
                 ui.label("Chat Flow: CSV Upload").classes("text-sm font-bold text-slate-700")
                 ui.label("Use this uploader to keep building the CSV workflow inside the assistant.").classes("text-xs text-slate-500 mb-2")
-                ui.upload(on_upload=handle_csv_upload, label="Drop CSV file", auto_upload=True).props(
-                    "accept=.csv,text/csv"
+                csv_upload = ui.upload(on_upload=handle_csv_upload, label="Drop CSV file", auto_upload=True).props(
+                    f"accept=.csv,text/csv max-file-size={MAX_CSV_UPLOAD_BYTES}"
                 ).classes("w-full upload-zone")
+                csv_upload.on("rejected", notify_csv_upload_rejected)
+                ui.label(f"Maximum CSV size: {MAX_CSV_UPLOAD_MB} MB").classes("text-xs text-slate-500 mt-2")
                 ui.label(
                     "You can keep adding CSV files here. When you are done, continue to Workspace so you can review the project before Modeling."
                 ).classes("text-xs text-slate-500 mt-2")
@@ -2058,6 +2105,7 @@ async def main_page() -> None:
                                 ui.label("#").classes("text-center")
                                 ui.label("File")
                                 ui.label("Type")
+                                ui.label("Size")
                                 ui.label("Status")
                                 ui.label("Action").classes("text-center")
                             for row in local_state["uploaded_tables"]:
@@ -2067,6 +2115,7 @@ async def main_page() -> None:
                                     ui.label(str(row["no"])).classes("text-xs text-slate-600 text-center")
                                     ui.label(str(row["file_name"])).classes("text-xs text-slate-700 cell-truncate")
                                     ui.label(str(row["mode"])).classes("text-xs text-slate-600")
+                                    ui.label(str(row.get("size_label") or "0 MB")).classes("text-xs text-slate-600")
                                     with ui.column().classes("gap-0"):
                                         ui.label(str(row["status"])).classes("text-xs text-slate-700")
                                         ui.label(str(row.get("message") or "")).classes("text-[10px] text-slate-500 leading-tight")
@@ -2462,6 +2511,16 @@ async def main_page() -> None:
 
         try:
             content = await e.file.read()
+            if len(content) > MAX_CSV_UPLOAD_BYTES:
+                safe_notify(f"CSV file size must be {MAX_CSV_UPLOAD_MB} MB or smaller.", notify_type="negative")
+                return
+            projected_total_bytes = uploaded_total_size_bytes() + len(content)
+            if projected_total_bytes > MAX_CSV_UPLOAD_BYTES:
+                safe_notify(
+                    f"Total uploaded CSV size must stay within {MAX_CSV_UPLOAD_MB} MB. Current total would become {format_file_size(projected_total_bytes)}.",
+                    notify_type="negative",
+                )
+                return
             digest = hashlib.sha1(content).hexdigest()
             recent_uploads = dict(local_state.get("recent_csv_uploads") or {})
             if digest in recent_uploads:
@@ -2472,7 +2531,7 @@ async def main_page() -> None:
 
             local_state["multi_csv_inflight"] += 1
             row_mode = "Primary" if not local_state["project_id"] else "Additional"
-            row_index = add_upload_row(e.file.name, row_mode)
+            row_index = add_upload_row(e.file.name, row_mode, size_bytes=len(content))
             safe_refresh(input_view)
 
             files = {"file": (e.file.name, content, "text/csv")}
@@ -3529,15 +3588,18 @@ async def main_page() -> None:
                 action_button("Change Mode", icon="tune", on_click=lambda: go_to_page("upload"), variant="outline", compact=True)
 
             if selected_mode == "csv":
-                with ui.card().classes("glass-panel lift p-6 w-full max-w-3xl"):
+                with ui.card().classes("glass-panel lift p-6 w-full max-w-5xl"):
                     ui.label("CSV Ingestion").classes("text-h5 font-bold text-sky-900 mb-1 setup-section-title")
                     ui.label("Upload real data and synthesize from observed patterns.").classes("text-sm text-slate-500 mb-3")
-                    ui.upload(on_upload=handle_csv_upload, label="Drop CSV file", auto_upload=True).props(
-                        "accept=.csv,text/csv"
+                    csv_upload = ui.upload(on_upload=handle_csv_upload, label="Drop CSV file", auto_upload=True).props(
+                        f"accept=.csv,text/csv max-file-size={MAX_CSV_UPLOAD_BYTES}"
                     ).classes("w-full upload-zone")
+                    csv_upload.on("rejected", notify_csv_upload_rejected)
+                    ui.label(f"Maximum CSV size: {MAX_CSV_UPLOAD_MB} MB").classes("text-xs text-slate-500 mt-2")
                     uploaded_count = uploaded_success_count()
                     with ui.row().classes("setup-stats"):
                         ui.label(f"Uploaded: {uploaded_count}").classes("setup-chip")
+                        ui.label(f"Total size: {format_file_size(uploaded_total_size_bytes())} / {MAX_CSV_UPLOAD_MB} MB").classes("setup-chip")
                         ui.label(
                             f"Active model: {'Ready' if local_state['project_id'] else 'Not created'}"
                         ).classes("setup-chip")
@@ -3556,6 +3618,7 @@ async def main_page() -> None:
                                     ui.label("#").classes("text-center")
                                     ui.label("File")
                                     ui.label("Type")
+                                    ui.label("Size")
                                     ui.label("Status")
                                     ui.label("Action").classes("text-center")
                                 for row in local_state["uploaded_tables"]:
@@ -3565,6 +3628,7 @@ async def main_page() -> None:
                                         ui.label(str(row["no"])).classes("text-xs text-slate-600 text-center")
                                         ui.label(str(row["file_name"])).classes("text-xs text-slate-700 cell-truncate")
                                         ui.label(str(row["mode"])).classes("text-xs text-slate-600")
+                                        ui.label(str(row.get("size_label") or "0 MB")).classes("text-xs text-slate-600")
                                         with ui.column().classes("gap-0"):
                                             ui.label(str(row["status"])).classes("text-xs text-slate-700")
                                             ui.label(str(row.get("message") or "")).classes("text-[10px] text-slate-500 leading-tight")
@@ -3829,8 +3893,10 @@ async def main_page() -> None:
                                 asyncio.create_task(refresh_correlations(str(selected.get("id") or "")))
                             ui.separator().classes("my-3 opacity-30")
                             corr_exp = ui.expansion("Correlation (numeric columns)", value=False).classes("w-full")
-                            attach_tooltip(corr_exp, "Linear correlation between numeric columns in the selected table.")
                             with corr_exp:
+                                with ui.row().classes("items-center gap-2 mb-2"):
+                                    ui.label("About this section").classes("text-xs font-medium text-slate-500")
+                                    inline_info_icon("Linear correlation between numeric columns in the selected table.")
                                 if local_state["is_loading_correlation"]:
                                     with ui.row().classes("items-center gap-2 text-slate-500"):
                                         ui.spinner(size="sm")
@@ -3854,8 +3920,10 @@ async def main_page() -> None:
 
                             ui.separator().classes("my-3 opacity-30")
                             assoc_exp = ui.expansion("Same-table Associations (categorical)", value=False).classes("w-full")
-                            attach_tooltip(assoc_exp, "Association strength between categorical columns in the same table.")
                             with assoc_exp:
+                                with ui.row().classes("items-center gap-2 mb-2"):
+                                    ui.label("About this section").classes("text-xs font-medium text-slate-500")
+                                    inline_info_icon("Association strength between categorical columns in the same table.")
                                 if local_state["is_loading_correlation"]:
                                     with ui.row().classes("items-center gap-2 text-slate-500"):
                                         ui.spinner(size="sm")
@@ -3880,8 +3948,10 @@ async def main_page() -> None:
 
                             ui.separator().classes("my-3 opacity-30")
                             llm_assoc_exp = ui.expansion("LLM Associations (same table)", value=False).classes("w-full")
-                            attach_tooltip(llm_assoc_exp, "LLM-inferred semantic relationships between columns in the selected table.")
                             with llm_assoc_exp:
+                                with ui.row().classes("items-center gap-2 mb-2"):
+                                    ui.label("About this section").classes("text-xs font-medium text-slate-500")
+                                    inline_info_icon("LLM-inferred semantic relationships between columns in the selected table.")
                                 if local_state["is_loading_correlation"]:
                                     with ui.row().classes("items-center gap-2 text-slate-500"):
                                         ui.spinner(size="sm")
@@ -3891,14 +3961,15 @@ async def main_page() -> None:
                                     ui.aggrid(
                                         {
                                             "columnDefs": [
-                                                {"headerName": "Column A", "field": "col_a", "minWidth": 160},
-                                                {"headerName": "Column B", "field": "col_b", "minWidth": 160},
-                                                {"headerName": "Association", "field": "association", "width": 160},
-                                                {"headerName": "Confidence", "field": "confidence", "width": 140, "valueFormatter": _llm_fmt},
+                                                {"headerName": "Column A", "field": "col_a", "minWidth": 160, "headerTooltip": "First column in the same-table association pair."},
+                                                {"headerName": "Column B", "field": "col_b", "minWidth": 160, "headerTooltip": "Second column in the same-table association pair."},
+                                                {"headerName": "Association", "field": "association", "width": 160, "headerTooltip": "Semantic association type inferred by the LLM."},
+                                                {"headerName": "Confidence", "field": "confidence", "width": 140, "valueFormatter": _llm_fmt, "headerTooltip": "Confidence score returned for this inferred association."},
                                                 {
                                                     "headerName": "Reason",
                                                     "field": "reason",
                                                     "minWidth": 900,
+                                                    "headerTooltip": "Short explanation of why the LLM linked these columns.",
                                                     "tooltipField": "reason",
                                                     "cellStyle": {"white-space": "nowrap"},
                                                 },

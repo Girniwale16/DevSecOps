@@ -583,6 +583,7 @@ EXPORT_DIR = "data/exports"
 LARGE_UPLOAD_THRESHOLD_MB = max(1, int(os.getenv("LARGE_UPLOAD_THRESHOLD_MB", "25")))
 FAST_PROFILE_SAMPLE_ROWS = max(1000, int(os.getenv("FAST_PROFILE_SAMPLE_ROWS", "10000")))
 CSV_PROFILE_SAMPLE_FOR_LARGE_FILES = str(os.getenv("CSV_PROFILE_SAMPLE_FOR_LARGE_FILES", "false")).strip().lower() in {"1", "true", "yes", "on"}
+MAX_CSV_UPLOAD_MB = max(1, int(os.getenv("MAX_CSV_UPLOAD_MB", "50")))
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(EXPORT_DIR, exist_ok=True)
 
@@ -609,6 +610,21 @@ def _safe_file_size_bytes(path: str) -> int:
     except Exception:
         return 0
 
+
+def _project_uploaded_size_bytes(project_id: str) -> int:
+    conn = get_db_connection()
+    try:
+        rows = conn.execute(
+            "SELECT file_path FROM tables WHERE project_id = CAST(? AS UUID)",
+            (project_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+    total = 0
+    for row in rows:
+        total += _safe_file_size_bytes(str((row or [None])[0] or ""))
+    return total
+
 @app.post("/upload")
 async def upload_csv(request: Request, file: UploadFile = File(...)):
     if not file.filename.endswith('.csv'):
@@ -622,6 +638,11 @@ async def upload_csv(request: Request, file: UploadFile = File(...)):
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
     upload_seconds = round(time.perf_counter() - upload_started, 2)
+    file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+    if file_size_mb > MAX_CSV_UPLOAD_MB:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        raise HTTPException(status_code=400, detail=f"CSV file size must be {MAX_CSV_UPLOAD_MB} MB or smaller")
 
     try:
         profile_started = time.perf_counter()
@@ -1786,6 +1807,20 @@ async def add_table(project_id: str, request: Request, file: UploadFile = File(.
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
     upload_seconds = round(time.perf_counter() - upload_started, 2)
+    file_size_bytes = _safe_file_size_bytes(file_path)
+    file_size_mb = file_size_bytes / (1024 * 1024)
+    if file_size_mb > MAX_CSV_UPLOAD_MB:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        raise HTTPException(status_code=400, detail=f"CSV file size must be {MAX_CSV_UPLOAD_MB} MB or smaller")
+    existing_project_size_bytes = _project_uploaded_size_bytes(project_id)
+    if existing_project_size_bytes + file_size_bytes > (MAX_CSV_UPLOAD_MB * 1024 * 1024):
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Total uploaded CSV size for a project must stay within {MAX_CSV_UPLOAD_MB} MB",
+        )
 
     try:
         profile_started = time.perf_counter()
