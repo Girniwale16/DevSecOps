@@ -1,4 +1,5 @@
 import os
+import logging
 import duckdb
 import shutil
 import uuid
@@ -15,7 +16,7 @@ from typing import Any, Dict, List, Optional
 
 from app.engine.profiler import get_csv_stats
 from app.engine.synthesizer import generate_synthetic_data
-from app.engine.metadata import init_db, get_db_connection
+from app.engine.metadata import DB_PATH, init_db, get_db_connection
 from app.engine.schema_parser import parse_ddl, normalize_schema
 from app.engine.mock_generator import generate_mock_from_schema
 from app.engine.multi_table_synthesizer import generate_multi_table_data, generate_multi_table_data_fast
@@ -32,6 +33,8 @@ from app.engine.llm_usage import sum_usage
 from app.auth import current_user_from_request, init_auth_storage, is_public_path, log_request_activity, router as auth_router
 import pandas as pd
 import numpy as np
+
+logger = logging.getLogger("uvicorn.error")
 
 def safe_df_to_dict(df):
     """Replaces NaN/Inf with None so it's JSON compliant."""
@@ -577,6 +580,9 @@ async def auth_guard(request: Request, call_next):
 
 UPLOAD_DIR = "data/uploads"
 EXPORT_DIR = "data/exports"
+LARGE_UPLOAD_THRESHOLD_MB = max(1, int(os.getenv("LARGE_UPLOAD_THRESHOLD_MB", "25")))
+FAST_PROFILE_SAMPLE_ROWS = max(1000, int(os.getenv("FAST_PROFILE_SAMPLE_ROWS", "10000")))
+CSV_PROFILE_SAMPLE_FOR_LARGE_FILES = str(os.getenv("CSV_PROFILE_SAMPLE_FOR_LARGE_FILES", "false")).strip().lower() in {"1", "true", "yes", "on"}
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(EXPORT_DIR, exist_ok=True)
 
@@ -584,21 +590,46 @@ os.makedirs(EXPORT_DIR, exist_ok=True)
 async def root():
     return {"message": "DataCosmos API is running"}
 
+
+def _profile_csv_for_upload(file_path: str) -> Dict[str, Any]:
+    file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+    sample_rows = (
+        FAST_PROFILE_SAMPLE_ROWS
+        if CSV_PROFILE_SAMPLE_FOR_LARGE_FILES and file_size_mb >= LARGE_UPLOAD_THRESHOLD_MB
+        else None
+    )
+    stats = get_csv_stats(file_path, sample_rows=sample_rows)
+    stats["file_size_mb"] = round(file_size_mb, 2)
+    return stats
+
+
+def _safe_file_size_bytes(path: str) -> int:
+    try:
+        return int(os.path.getsize(path))
+    except Exception:
+        return 0
+
 @app.post("/upload")
 async def upload_csv(request: Request, file: UploadFile = File(...)):
     if not file.filename.endswith('.csv'):
         raise HTTPException(status_code=400, detail="Only CSV files are allowed")
-    
+
     project_id = str(uuid.uuid4())
     table_id = str(uuid.uuid4())
     file_path = os.path.join(UPLOAD_DIR, f"{table_id}.csv")
-    
+
+    upload_started = time.perf_counter()
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
-    
+    upload_seconds = round(time.perf_counter() - upload_started, 2)
+
     try:
-        stats = get_csv_stats(file_path)
+        profile_started = time.perf_counter()
+        stats = _profile_csv_for_upload(file_path)
+        metadata_seconds = round(time.perf_counter() - profile_started, 2)
+        total_seconds = round(upload_seconds + metadata_seconds, 2)
         initial_table_name = os.path.splitext(file.filename)[0].strip() or "table_1"
+        metadata_db_before = _safe_file_size_bytes(DB_PATH)
         
         conn = get_db_connection()
         # 1. Create Project
@@ -607,7 +638,7 @@ async def upload_csv(request: Request, file: UploadFile = File(...)):
         
         # 2. Create Table
         conn.execute("INSERT INTO tables (id, project_id, name, file_path, row_count) VALUES (?, ?, ?, ?, ?)",
-                     (table_id, project_id, initial_table_name, file_path, stats["total_rows"]))
+                     (table_id, project_id, initial_table_name, file_path, stats.get("total_rows")))
         
         # 3. Create Columns and Profiles
         for col in stats["columns"]:
@@ -623,19 +654,49 @@ async def upload_csv(request: Request, file: UploadFile = File(...)):
             """, (str(uuid.uuid4()), col_id, col["nulls"], col["min"], col["max"], col["cardinality"], col.get("sd"), col.get("variance"), col.get("null_value_percent")))
             
         conn.close()
+        metadata_db_after = _safe_file_size_bytes(DB_PATH)
+        metadata_db_delta_bytes = max(0, metadata_db_after - metadata_db_before)
 
         log_request_activity(
             request,
             "upload_csv",
             project_id=project_id,
             table_id=table_id,
-            details={"filename": file.filename, "row_count": stats["total_rows"]},
+            details={
+                "filename": file.filename,
+                "row_count": stats.get("total_rows"),
+                "profile_mode": stats.get("profile_mode"),
+                "profiled_rows": stats.get("profiled_rows"),
+                "file_size_mb": stats.get("file_size_mb"),
+                "upload_seconds": upload_seconds,
+                "metadata_seconds": metadata_seconds,
+                "total_seconds": total_seconds,
+            },
+        )
+        logger.info(
+            "CSV upload complete filename=%s file_size_mb=%.2f profile_mode=%s profiled_rows=%s total_rows=%s columns=%d metadata_db_delta_kb=%.2f metadata_db_size_mb=%.2f upload_seconds=%.2f metadata_seconds=%.2f total_seconds=%.2f",
+            file.filename,
+            float(stats.get("file_size_mb") or 0.0),
+            str(stats.get("profile_mode") or "full"),
+            str(stats.get("profiled_rows")),
+            str(stats.get("total_rows")),
+            len(stats.get("columns") or []),
+            metadata_db_delta_bytes / 1024.0,
+            metadata_db_after / (1024.0 * 1024.0),
+            float(upload_seconds),
+            float(metadata_seconds),
+            float(total_seconds),
         )
         return {
             "project_id": project_id,
             "table_id": table_id,
             "filename": file.filename,
-            "stats": stats
+            "stats": stats,
+            "timing": {
+                "upload_seconds": upload_seconds,
+                "metadata_seconds": metadata_seconds,
+                "total_seconds": total_seconds,
+            },
         }
     except Exception as e:
         if os.path.exists(file_path): os.remove(file_path)
@@ -1720,33 +1781,73 @@ async def add_table(project_id: str, request: Request, file: UploadFile = File(.
     
     table_id = str(uuid.uuid4())
     file_path = os.path.join(UPLOAD_DIR, f"{table_id}.csv")
-    
+
+    upload_started = time.perf_counter()
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
-    
+    upload_seconds = round(time.perf_counter() - upload_started, 2)
+
     try:
-        stats = get_csv_stats(file_path)
+        profile_started = time.perf_counter()
+        stats = _profile_csv_for_upload(file_path)
+        metadata_seconds = round(time.perf_counter() - profile_started, 2)
+        total_seconds = round(upload_seconds + metadata_seconds, 2)
+        metadata_db_before = _safe_file_size_bytes(DB_PATH)
         conn = get_db_connection()
         # Create Table
         conn.execute("INSERT INTO tables (id, project_id, name, file_path, row_count) VALUES (?, ?, ?, ?, ?)",
-                     (table_id, project_id, file.filename.replace('.csv', ''), file_path, stats["total_rows"]))
+                     (table_id, project_id, file.filename.replace('.csv', ''), file_path, stats.get("total_rows")))
         
         # Create Columns and Profiles
         for col in stats["columns"]:
             col_id = str(uuid.uuid4())
             conn.execute("INSERT INTO columns (id, table_id, name, data_type) VALUES (?, ?, ?, ?)", 
                          (col_id, table_id, col["column"], col["type"]))
-            conn.execute("INSERT INTO column_profiles (id, column_id, null_count, min_val, max_val, cardinality, sd, variance, null_value_percent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            conn.execute("INSERT INTO column_profiles (id, column_id, null_count, min_val, max_val, cardinality, sd, variance, null_value_percent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", 
                          (str(uuid.uuid4()), col_id, col["nulls"], col["min"], col["max"], col["cardinality"], col.get("sd"), col.get("variance"), col.get("null_value_percent")))
         conn.close()
+        metadata_db_after = _safe_file_size_bytes(DB_PATH)
+        metadata_db_delta_bytes = max(0, metadata_db_after - metadata_db_before)
         log_request_activity(
             request,
             "add_table",
             project_id=project_id,
             table_id=table_id,
-            details={"filename": file.filename, "row_count": stats["total_rows"]},
+            details={
+                "filename": file.filename,
+                "row_count": stats.get("total_rows"),
+                "profile_mode": stats.get("profile_mode"),
+                "profiled_rows": stats.get("profiled_rows"),
+                "file_size_mb": stats.get("file_size_mb"),
+                "upload_seconds": upload_seconds,
+                "metadata_seconds": metadata_seconds,
+                "total_seconds": total_seconds,
+            },
         )
-        return {"table_id": table_id, "stats": stats}
+        logger.info(
+            "CSV add-table complete project_id=%s filename=%s file_size_mb=%.2f profile_mode=%s profiled_rows=%s total_rows=%s columns=%d metadata_db_delta_kb=%.2f metadata_db_size_mb=%.2f upload_seconds=%.2f metadata_seconds=%.2f total_seconds=%.2f",
+            project_id,
+            file.filename,
+            float(stats.get("file_size_mb") or 0.0),
+            str(stats.get("profile_mode") or "full"),
+            str(stats.get("profiled_rows")),
+            str(stats.get("total_rows")),
+            len(stats.get("columns") or []),
+            metadata_db_delta_bytes / 1024.0,
+            metadata_db_after / (1024.0 * 1024.0),
+            float(upload_seconds),
+            float(metadata_seconds),
+            float(total_seconds),
+        )
+        return {
+            "table_id": table_id,
+            "stats": stats,
+            "timing": {
+                "upload_seconds": upload_seconds,
+                "metadata_seconds": metadata_seconds,
+                "total_seconds": total_seconds,
+            },
+        }
     except Exception as e:
         if os.path.exists(file_path): os.remove(file_path)
         raise HTTPException(status_code=500, detail=str(e))
