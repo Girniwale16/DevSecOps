@@ -21,6 +21,7 @@ from auth import (
 
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
 UI_TIMEZONE = os.getenv("UI_TIMEZONE", "Asia/Kolkata")
+UPLOAD_REQUEST_TIMEOUT = float(os.getenv("UPLOAD_REQUEST_TIMEOUT", "300"))
 
 
 def _patch_nicegui_process_pool_setup() -> None:
@@ -2056,7 +2057,9 @@ async def main_page() -> None:
                                     ui.label(str(row["no"])).classes("text-xs text-slate-600 text-center")
                                     ui.label(str(row["file_name"])).classes("text-xs text-slate-700 cell-truncate")
                                     ui.label(str(row["mode"])).classes("text-xs text-slate-600")
-                                    ui.label(str(row["status"])).classes("text-xs text-slate-700")
+                                    with ui.column().classes("gap-0"):
+                                        ui.label(str(row["status"])).classes("text-xs text-slate-700")
+                                        ui.label(str(row.get("message") or "")).classes("text-[10px] text-slate-500 leading-tight")
                                     delete_btn = ui.button(icon="delete").props("flat dense round color=negative size=sm")
                                     delete_btn.classes("justify-self-center")
                                     delete_btn.on_click(lambda _, row_no=row["no"]: asyncio.create_task(delete_uploaded_table(row_no)))
@@ -2464,7 +2467,7 @@ async def main_page() -> None:
 
             files = {"file": (e.file.name, content, "text/csv")}
             if not local_state["project_id"]:
-                async with api_client(timeout=60.0) as client:
+                async with api_client(timeout=UPLOAD_REQUEST_TIMEOUT) as client:
                     resp = await client.post(f"{BACKEND_URL}/upload", files=files)
                     data = await parse_response(resp)
 
@@ -2489,7 +2492,7 @@ async def main_page() -> None:
                 safe_notify("Primary CSV uploaded.", notify_type="positive")
             else:
                 active_project_id = str(local_state["project_id"])
-                async with api_client(timeout=60.0) as client:
+                async with api_client(timeout=UPLOAD_REQUEST_TIMEOUT) as client:
                     resp = await client.post(
                         f"{BACKEND_URL}/project/{active_project_id}/add-table",
                         files=files,
@@ -3552,7 +3555,9 @@ async def main_page() -> None:
                                         ui.label(str(row["no"])).classes("text-xs text-slate-600 text-center")
                                         ui.label(str(row["file_name"])).classes("text-xs text-slate-700 cell-truncate")
                                         ui.label(str(row["mode"])).classes("text-xs text-slate-600")
-                                        ui.label(str(row["status"])).classes("text-xs text-slate-700")
+                                        with ui.column().classes("gap-0"):
+                                            ui.label(str(row["status"])).classes("text-xs text-slate-700")
+                                            ui.label(str(row.get("message") or "")).classes("text-[10px] text-slate-500 leading-tight")
                                         delete_btn = ui.button(icon="delete").props("flat dense round color=negative size=sm")
                                         delete_btn.classes("justify-self-center")
                                         delete_btn.on_click(lambda _, row_no=row["no"]: asyncio.create_task(delete_uploaded_table(row_no)))
