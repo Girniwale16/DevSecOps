@@ -12,6 +12,8 @@ from app.engine.metadata import get_db_connection
 
 AUTH_USERNAME = os.getenv("AUTH_USERNAME", "admin")
 AUTH_PASSWORD = os.getenv("AUTH_PASSWORD", "[REDACTED_GENERIC_PASSWORD_1]")
+SUPER_ADMIN_USERNAME = os.getenv("SUPER_ADMIN_USERNAME", "superadmin")
+SUPER_ADMIN_PASSWORD = os.getenv("SUPER_ADMIN_PASSWORD", "[REDACTED_GENERIC_PASSWORD_2]")
 
 PUBLIC_PATHS = {
     "/",
@@ -21,8 +23,13 @@ PUBLIC_PATHS = {
     "/redoc",
 }
 
-ADMIN_ROLES = {"admin"}
-USER_ROLES = {"admin", "user"}
+SUPER_ADMIN_ROLE = "super_admin"
+ADMIN_ROLE = "admin"
+USER_ROLE = "user"
+
+PRIVILEGED_ROLES = {SUPER_ADMIN_ROLE, ADMIN_ROLE}
+ADMIN_ROLES = set(PRIVILEGED_ROLES)
+USER_ROLES = {SUPER_ADMIN_ROLE, ADMIN_ROLE, USER_ROLE}
 
 sessions: Dict[str, Dict[str, Any]] = {}
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -45,9 +52,9 @@ def extract_bearer_token(raw_header: Optional[str]) -> Optional[str]:
 
 
 def _normalize_role(value: Any) -> str:
-    role = str(value or "user").strip().lower()
+    role = str(value or USER_ROLE).strip().lower()
     if role not in USER_ROLES:
-        raise HTTPException(status_code=400, detail="Role must be 'admin' or 'user'")
+        raise HTTPException(status_code=400, detail="Role must be 'super_admin', 'admin', or 'user'")
     return role
 
 
@@ -81,6 +88,20 @@ def _hash_password(password: str, salt: Optional[str] = None) -> tuple[str, str]
 def _verify_password(password: str, salt: str, password_hash: str) -> bool:
     _, computed_hash = _hash_password(password, salt)
     return secrets.compare_digest(computed_hash, str(password_hash or ""))
+
+
+def _has_super_admin_rights(user: Optional[Dict[str, Any]]) -> bool:
+    return str((user or {}).get("role") or "").strip().lower() == SUPER_ADMIN_ROLE
+
+
+def _assert_can_manage_target_user(actor_user: Dict[str, Any], target_role: str, action_label: str) -> None:
+    if target_role == SUPER_ADMIN_ROLE and not _has_super_admin_rights(actor_user):
+        raise HTTPException(status_code=403, detail=f"Only super admin can {action_label} super admin accounts")
+
+
+def _assert_can_assign_role(actor_user: Dict[str, Any], requested_role: str) -> None:
+    if requested_role == SUPER_ADMIN_ROLE and not _has_super_admin_rights(actor_user):
+        raise HTTPException(status_code=403, detail="Only super admin can assign super admin role")
 
 
 def _token_reference(token: Optional[str]) -> Optional[str]:
@@ -138,6 +159,22 @@ def init_auth_storage() -> None:
         """
     )
 
+    existing_super_admin = conn.execute(
+        "SELECT username FROM app_users WHERE lower(username) = lower(?) LIMIT 1",
+        (SUPER_ADMIN_USERNAME,),
+    ).fetchone()
+    if not existing_super_admin:
+        salt, password_hash = _hash_password(SUPER_ADMIN_PASSWORD)
+        conn.execute(
+            """
+            INSERT INTO app_users (
+                username, password_salt, password_hash, role, is_active, created_at, updated_at, password_changed_at
+            )
+            VALUES (?, ?, ?, ?, TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """,
+            (SUPER_ADMIN_USERNAME, salt, password_hash, SUPER_ADMIN_ROLE),
+        )
+
     existing_admin = conn.execute(
         "SELECT username FROM app_users WHERE lower(username) = lower(?) LIMIT 1",
         (AUTH_USERNAME,),
@@ -149,9 +186,9 @@ def init_auth_storage() -> None:
             INSERT INTO app_users (
                 username, password_salt, password_hash, role, is_active, created_at, updated_at, password_changed_at
             )
-            VALUES (?, ?, ?, 'admin', TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            VALUES (?, ?, ?, ?, TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             """,
-            (AUTH_USERNAME, salt, password_hash),
+            (AUTH_USERNAME, salt, password_hash, ADMIN_ROLE),
         )
     conn.close()
 
@@ -187,7 +224,16 @@ def _public_user_payload(username: str) -> Dict[str, Any]:
 
 def _count_active_admins(conn: Any) -> int:
     row = conn.execute(
-        "SELECT COUNT(*) FROM app_users WHERE role = 'admin' AND is_active = TRUE"
+        "SELECT COUNT(*) FROM app_users WHERE role IN (?, ?) AND is_active = TRUE",
+        (SUPER_ADMIN_ROLE, ADMIN_ROLE),
+    ).fetchone()
+    return int(row[0] or 0) if row else 0
+
+
+def _count_active_super_admins(conn: Any) -> int:
+    row = conn.execute(
+        "SELECT COUNT(*) FROM app_users WHERE role = ? AND is_active = TRUE",
+        (SUPER_ADMIN_ROLE,),
     ).fetchone()
     return int(row[0] or 0) if row else 0
 
@@ -475,6 +521,7 @@ async def admin_create_user(request: Request, payload: Dict[str, Any] = Body(def
     username = _normalize_username(payload.get("username"))
     password = _normalize_password(payload.get("password"))
     role = _normalize_role(payload.get("role"))
+    _assert_can_assign_role(admin_user, role)
     is_active = bool(payload.get("is_active", True))
 
     conn = get_db_connection()
@@ -510,12 +557,17 @@ async def admin_reset_password(username: str, request: Request, payload: Dict[st
 
     conn = get_db_connection()
     existing = conn.execute(
-        "SELECT username FROM app_users WHERE lower(username) = lower(?) LIMIT 1",
+        "SELECT username, role FROM app_users WHERE lower(username) = lower(?) LIMIT 1",
         (clean_username,),
     ).fetchone()
     if not existing:
         conn.close()
         raise HTTPException(status_code=404, detail="User not found")
+    try:
+        _assert_can_manage_target_user(admin_user, str(existing[1] or "").strip().lower(), "reset passwords for")
+    except HTTPException:
+        conn.close()
+        raise
 
     conn.execute(
         """
@@ -535,6 +587,7 @@ async def admin_change_role(username: str, request: Request, payload: Dict[str, 
     admin_user = require_admin(request)
     clean_username = _normalize_username(username)
     new_role = _normalize_role(payload.get("role"))
+    _assert_can_assign_role(admin_user, new_role)
 
     conn = get_db_connection()
     row = conn.execute(
@@ -546,12 +599,22 @@ async def admin_change_role(username: str, request: Request, payload: Dict[str, 
         raise HTTPException(status_code=404, detail="User not found")
 
     db_username, current_role, is_active = row
-    if db_username.lower() == admin_user["username"].lower() and current_role == "admin" and new_role != "admin":
+    current_role = str(current_role or "").strip().lower()
+    try:
+        _assert_can_manage_target_user(admin_user, current_role, "change roles for")
+    except HTTPException:
         conn.close()
-        raise HTTPException(status_code=400, detail="You cannot remove your own admin role")
-    if current_role == "admin" and new_role != "admin" and is_active and _count_active_admins(conn) <= 1:
+        raise
+
+    if db_username.lower() == admin_user["username"].lower() and current_role in PRIVILEGED_ROLES and new_role not in PRIVILEGED_ROLES:
+        conn.close()
+        raise HTTPException(status_code=400, detail="You cannot remove your own privileged role")
+    if current_role in PRIVILEGED_ROLES and new_role not in PRIVILEGED_ROLES and is_active and _count_active_admins(conn) <= 1:
         conn.close()
         raise HTTPException(status_code=400, detail="At least one active admin must remain")
+    if current_role == SUPER_ADMIN_ROLE and new_role != SUPER_ADMIN_ROLE and is_active and _count_active_super_admins(conn) <= 1:
+        conn.close()
+        raise HTTPException(status_code=400, detail="At least one active super admin must remain")
 
     conn.execute(
         "UPDATE app_users SET role = ?, updated_at = CURRENT_TIMESTAMP WHERE lower(username) = lower(?)",
@@ -578,15 +641,24 @@ async def admin_change_status(username: str, request: Request, payload: Dict[str
         raise HTTPException(status_code=404, detail="User not found")
 
     db_username, current_role, current_active = row
+    current_role = str(current_role or "").strip().lower()
+    try:
+        _assert_can_manage_target_user(admin_user, current_role, "change status for")
+    except HTTPException:
+        conn.close()
+        raise
     if bool(current_active) == is_active:
         conn.close()
         return {"ok": True, "user": _public_user_payload(db_username)}
     if db_username.lower() == admin_user["username"].lower() and not is_active:
         conn.close()
         raise HTTPException(status_code=400, detail="You cannot deactivate your own account")
-    if current_role == "admin" and not is_active and _count_active_admins(conn) <= 1:
+    if current_role in PRIVILEGED_ROLES and not is_active and _count_active_admins(conn) <= 1:
         conn.close()
         raise HTTPException(status_code=400, detail="At least one active admin must remain")
+    if current_role == SUPER_ADMIN_ROLE and not is_active and _count_active_super_admins(conn) <= 1:
+        conn.close()
+        raise HTTPException(status_code=400, detail="At least one active super admin must remain")
 
     conn.execute(
         "UPDATE app_users SET is_active = ?, updated_at = CURRENT_TIMESTAMP WHERE lower(username) = lower(?)",
@@ -612,12 +684,21 @@ async def admin_delete_user(username: str, request: Request):
         raise HTTPException(status_code=404, detail="User not found")
 
     db_username, current_role, is_active = row
+    current_role = str(current_role or "").strip().lower()
+    try:
+        _assert_can_manage_target_user(admin_user, current_role, "delete")
+    except HTTPException:
+        conn.close()
+        raise
     if db_username.lower() == admin_user["username"].lower():
         conn.close()
         raise HTTPException(status_code=400, detail="You cannot delete your own account")
-    if current_role == "admin" and is_active and _count_active_admins(conn) <= 1:
+    if current_role in PRIVILEGED_ROLES and is_active and _count_active_admins(conn) <= 1:
         conn.close()
         raise HTTPException(status_code=400, detail="At least one active admin must remain")
+    if current_role == SUPER_ADMIN_ROLE and is_active and _count_active_super_admins(conn) <= 1:
+        conn.close()
+        raise HTTPException(status_code=400, detail="At least one active super admin must remain")
 
     conn.execute("DELETE FROM app_users WHERE lower(username) = lower(?)", (clean_username,))
     conn.close()

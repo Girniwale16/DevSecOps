@@ -1,2 +1,0 @@
-WARNING:root:NiceGUI process pool disabled: [WinError 5] Access is denied
-ERROR:    [Errno 13] error while attempting to bind on address ('0.0.0.0', 8081): [winerror 10013] an attempt was made to access a socket in a way forbidden by its access permissions

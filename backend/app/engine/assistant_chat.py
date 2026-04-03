@@ -217,7 +217,7 @@ def _build_prompt(
         "- If the user asks for a schema project with columns, keep them on Input so they can fill in schema details.\n"
         "- If the user asks where to upload a CSV while on Setup with CSV selected, move them to Input because the uploader lives there.\n"
         "- If the user asks to skip a step, move only to the next valid workflow step.\n"
-        "- If the request is unclear or outside the workflow, reply with the next workflow step instead of inventing a side task.\n"
+        "- If the request is unclear or outside the workflow, reply sorry im not allowed to do that or i donot have data about that and continue with the next workflow step instead of inventing a side task.\n"
         "- If the user asks a question, answer it directly in reply.\n"
         "- Keep reply under 90 words.\n"
         "- Do not mention JSON.\n"

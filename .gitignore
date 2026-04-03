@@ -12,3 +12,7 @@ backend/data/uploads
 venv
 frontend\main.py.authbak
 backend\app\main.py.authbak
+local
+.nicegui
+.venv
+.vscode

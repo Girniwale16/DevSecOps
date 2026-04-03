@@ -1,0 +1,23 @@
+[project]
+name = "data-cosmos"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "duckdb>=1.5.1",
+    "faker>=40.11.1",
+    "fastapi>=0.135.2",
+    "httpx>=0.28.1",
+    "networkx>=3.6.1",
+    "nicegui>=3.9.0",
+    "pandas>=2.3.3",
+    "pyarrow>=23.0.1",
+    "python-dotenv>=1.2.2",
+    "python-multipart>=0.0.22",
+    "sdv>=1.35.0",
+    "spacy>=3.8.13",
+    "sqlglot>=30.1.0",
+    "torch>=2.11.0",
+    "uvicorn>=0.42.0",
+]

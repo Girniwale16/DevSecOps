@@ -495,8 +495,14 @@ async def main_page() -> None:
         user = local_state.get("auth_user")
         return user if isinstance(user, dict) else {}
 
+    def auth_role() -> str:
+        return str(auth_user().get("role") or "").strip().lower()
+
+    def is_super_admin_user() -> bool:
+        return auth_role() == "super_admin"
+
     def is_admin_user() -> bool:
-        return str(auth_user().get("role") or "").strip().lower() == "admin"
+        return auth_role() in {"super_admin", "admin"}
 
     def format_timestamp(value: Any) -> str:
         if value in (None, ""):
@@ -617,6 +623,11 @@ async def main_page() -> None:
         local_state["admin_create_active"] = True
         if refresh:
             safe_refresh(admin_view)
+
+    def assignable_roles() -> List[str]:
+        if is_super_admin_user():
+            return ["super_admin", "admin", "user"]
+        return ["admin", "user"]
 
     def validate_password_rule(password: str, *, label: str = "Password") -> bool:
         clean = str(password or "")
@@ -4314,7 +4325,8 @@ async def main_page() -> None:
         visible_users = [user for user in users if not search_text or search_text in str(user.get("username") or "").lower()]
         total_users = len(users)
         active_users = sum(1 for user in users if user.get("is_active"))
-        admin_users = sum(1 for user in users if str(user.get("role") or "") == "admin")
+        admin_users = sum(1 for user in users if str(user.get("role") or "") in {"admin", "super_admin"})
+        super_admin_users = sum(1 for user in users if str(user.get("role") or "") == "super_admin")
 
         def render_stat_card(label: str, value: Any, accent: str) -> None:
             with ui.card().classes("glass-panel p-5 min-w-[180px] flex-1"):
@@ -4387,7 +4399,7 @@ async def main_page() -> None:
         def open_role_dialog(username: str, current_role: str) -> None:
             with ui.dialog() as dialog, ui.card().classes("glass-panel p-6 w-[420px] max-w-full"):
                 ui.label(f"Change Role: {username}").classes("text-lg font-bold").style("color: var(--nexus-brand);")
-                role_select = ui.select(["admin", "user"], value=current_role, label="Role").props("outlined")
+                role_select = ui.select(assignable_roles(), value=current_role, label="Role").props("outlined")
                 role_select.classes("w-full")
                 with ui.row().classes("w-full justify-end gap-2 mt-4"):
                     action_button("Cancel", icon="close", on_click=dialog.close, variant="outline", compact=True)
@@ -4494,7 +4506,7 @@ async def main_page() -> None:
                     local_state, "admin_create_confirm_password"
                 ).props("outlined")
                 confirm_input.classes("w-full")
-                role_select = ui.select(["admin", "user"], label="Role").bind_value(local_state, "admin_create_role").props("outlined")
+                role_select = ui.select(assignable_roles(), label="Role").bind_value(local_state, "admin_create_role").props("outlined")
                 role_select.classes("w-full")
                 ui.switch("Active").bind_value(local_state, "admin_create_active").classes("mt-2")
                 with ui.row().classes("w-full justify-end gap-2 mt-4"):
@@ -4518,6 +4530,7 @@ async def main_page() -> None:
                 render_stat_card("Total Users", total_users, "var(--nexus-brand)")
                 render_stat_card("Active Users", active_users, "#059669")
                 render_stat_card("Admins", admin_users, "#d97706")
+                render_stat_card("Super Admins", super_admin_users, "#7c3aed")
 
             with ui.row().classes("w-full items-start"):
                 with ui.card().classes("glass-panel admin-workflow-card p-6 w-full"):
@@ -4553,11 +4566,13 @@ async def main_page() -> None:
                             role = str(user.get("role") or "user")
                             is_active = bool(user.get("is_active"))
                             is_self = username.lower() == str(auth_user().get("username") or "").lower()
-                            title = f"{username} {'• admin' if role == 'admin' else '• user'} {'• active' if is_active else '• inactive'}"
+                            can_manage_target = is_super_admin_user() or role != "super_admin"
+                            role_badge = "super admin" if role == "super_admin" else ("admin" if role == "admin" else "user")
+                            title = f"{username} - {role_badge} {'- active' if is_active else '- inactive'}"
                             with ui.expansion(title, value=False).classes("admin-user-card w-full p-2 mb-3"):
                                 with ui.column().classes("p-3 gap-3"):
                                     with ui.row().classes("w-full gap-2 flex-wrap"):
-                                        ui.label(role.title()).classes("setup-chip")
+                                        ui.label(role.replace("_", " ").title()).classes("setup-chip")
                                         ui.label("Active" if is_active else "Inactive").classes(
                                             "setup-chip"
                                         ).style(
@@ -4585,14 +4600,14 @@ async def main_page() -> None:
                                             on_click=lambda name=username: open_reset_password_dialog(name),
                                             variant="outline",
                                             compact=True,
-                                        )
+                                        ).set_enabled(can_manage_target)
                                         action_button(
                                             "Change Role",
                                             icon="manage_accounts",
                                             on_click=lambda name=username, current_role=role: open_role_dialog(name, current_role),
                                             variant="outline",
                                             compact=True,
-                                        ).set_enabled(not is_self)
+                                        ).set_enabled(not is_self and can_manage_target)
                                         action_button(
                                             "Deactivate" if is_active else "Activate",
                                             icon="toggle_off" if is_active else "toggle_on",
@@ -4601,14 +4616,14 @@ async def main_page() -> None:
                                             ),
                                             variant="warning" if is_active else "success",
                                             compact=True,
-                                        ).set_enabled(not is_self)
+                                        ).set_enabled(not is_self and can_manage_target)
                                         action_button(
                                             "Delete",
                                             icon="delete",
                                             on_click=lambda name=username: open_delete_dialog(name),
                                             variant="danger",
                                             compact=True,
-                                        ).set_enabled(not is_self)
+                                        ).set_enabled(not is_self and can_manage_target)
                                         action_button(
                                             "Logs",
                                             icon="history",
