@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import httpx
+import pandas as pd
 from dotenv import load_dotenv
 from app.engine.llm_usage import extract_usage
 
@@ -19,12 +20,159 @@ GROQ_MODEL = os.getenv("GROQ_ASSISTANT_MODEL", os.getenv("GROQ_MODEL", "llama-3.
 VALID_PAGES = {"upload", "input", "project", "modeling", "generate"}
 VALID_SETUP_MODES = {"csv", "schema"}
 VALID_OPERATIONS = {"refresh_summary", "refresh_plan", "infer_semantics", "launch_generation"}
+SAMPLE_CONTEXT_ROWS = 40
+SAMPLE_VALUES_PER_COLUMN = 4
+MAX_INSIGHT_COLUMNS = 6
 
 
 def _to_text(value: Any) -> str:
     if value is None:
         return ""
     return str(value)
+
+
+def _to_number(value: Any) -> Optional[float]:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _compact_value(value: Any, *, max_len: int = 64) -> Optional[str]:
+    text = _to_text(value).strip()
+    if not text:
+        return None
+    return text if len(text) <= max_len else f"{text[:max_len]}..."
+
+
+def _parse_list_like(value: Any, *, max_items: int = 8, max_len: int = 40) -> List[str]:
+    raw = _to_text(value).strip()
+    if not raw:
+        return []
+    parsed: List[Any] = []
+    if raw.startswith("[") and raw.endswith("]"):
+        try:
+            maybe_list = json.loads(raw)
+            if isinstance(maybe_list, list):
+                parsed = maybe_list
+        except Exception:
+            parsed = []
+    if not parsed:
+        parsed = [part.strip() for part in raw.split(",") if str(part).strip()]
+    out: List[str] = []
+    for item in parsed[:max_items]:
+        compact = _compact_value(item, max_len=max_len)
+        if compact:
+            out.append(compact)
+    return out
+
+
+def _table_sample_insights(table: Dict[str, Any]) -> Dict[str, Any]:
+    file_path = _to_text(table.get("file_path")).strip()
+    if not file_path or not os.path.exists(file_path):
+        return {}
+    try:
+        df = pd.read_csv(file_path, nrows=SAMPLE_CONTEXT_ROWS)
+    except Exception:
+        return {}
+    if df.empty:
+        return {}
+
+    per_column: List[Dict[str, Any]] = []
+    for col_name in list(df.columns)[:MAX_INSIGHT_COLUMNS]:
+        series = df[col_name]
+        non_null = series.dropna()
+        if non_null.empty:
+            continue
+        col_entry = {
+            "name": _to_text(col_name),
+            "sample_values": [
+                _compact_value(v, max_len=32)
+                for v in non_null.head(SAMPLE_VALUES_PER_COLUMN).tolist()
+            ],
+        }
+        col_entry["sample_values"] = [v for v in col_entry["sample_values"] if v]
+        per_column.append(col_entry)
+
+    return {
+        "sample_size": int(len(df)),
+        "column_samples": per_column,
+    }
+
+
+def _next_step_text(current_page: str, has_project: bool) -> str:
+    page_labels = {
+        "upload": "Setup",
+        "input": "Input",
+        "project": "Workspace",
+        "modeling": "Modeling",
+        "generate": "Generate",
+    }
+    nxt = _next_valid_step(current_page=current_page, has_project=has_project)
+    return page_labels.get(nxt, page_labels.get(current_page, "Setup"))
+
+
+def _extract_table_column(message: str) -> Optional[tuple[str, str]]:
+    text = _to_text(message).strip()
+    match = re.search(r"\b([a-zA-Z_][\w]*)\.([a-zA-Z_][\w]*)\b", text)
+    if not match:
+        return None
+    return match.group(1), match.group(2)
+
+
+def _requested_field(message: str) -> Optional[str]:
+    lowered = _to_text(message).strip().lower()
+    if "null" in lowered:
+        return "null_percent"
+    if "min" in lowered or "minimum" in lowered:
+        return "min"
+    if "max" in lowered or "maximum" in lowered:
+        return "max"
+    if "pii" in lowered:
+        return "is_pii"
+    if "relationship" in lowered or "relation" in lowered or "foreign key" in lowered or "fk" in lowered:
+        return "relationship"
+    return None
+
+
+def _column_from_context(project_context: Dict[str, Any], table_name: str, column_name: str) -> Optional[Dict[str, Any]]:
+    for table in project_context.get("tables", []):
+        if _to_text(table.get("name")).strip().lower() != table_name.lower():
+            continue
+        for col in table.get("columns", []):
+            if _to_text(col.get("name")).strip().lower() == column_name.lower():
+                return col
+    return None
+
+
+def _is_missing_requested_data(*, message: str, project_context: Dict[str, Any]) -> Optional[str]:
+    field = _requested_field(message)
+    table_column = _extract_table_column(message)
+    if not field or not table_column:
+        return None
+    table_name, column_name = table_column
+
+    if field == "relationship":
+        has_rel = any(
+            _to_text(r.get("from_table")).strip().lower() == table_name.lower()
+            and _to_text(r.get("from_column")).strip().lower() == column_name.lower()
+            for r in project_context.get("relations", [])
+        ) or any(
+            _to_text(r.get("to_table")).strip().lower() == table_name.lower()
+            and _to_text(r.get("to_column")).strip().lower() == column_name.lower()
+            for r in project_context.get("relations", [])
+        )
+        return "relationship" if not has_rel else None
+
+    col = _column_from_context(project_context, table_name, column_name)
+    if not col:
+        return field
+    val = col.get(field)
+    if field == "is_pii":
+        return None if val is not None else field
+    return field if val in (None, "") else None
 
 
 def _safe_json_loads(text: str) -> Optional[Dict[str, Any]]:
@@ -42,28 +190,71 @@ def _safe_json_loads(text: str) -> Optional[Dict[str, Any]]:
 
 
 def _compact_project_context(project: Optional[Dict[str, Any]], tables: List[Dict[str, Any]], relations: List[Dict[str, Any]]) -> Dict[str, Any]:
+    compact_tables: List[Dict[str, Any]] = []
+    for idx, table in enumerate(tables[:8]):
+        compact_columns: List[Dict[str, Any]] = []
+        pii_count = 0
+        for column in table.get("columns", [])[:20]:
+            is_pii = bool(column.get("is_pii", False))
+            pii_count += 1 if is_pii else 0
+            compact_columns.append(
+                {
+                    "name": _to_text(column.get("name")),
+                    "data_type": _to_text(column.get("data_type")),
+                    "is_pk": bool(column.get("is_pk", False)),
+                    "is_nullable": bool(column.get("is_nullable", True)),
+                    "is_pii": is_pii,
+                    "generator_type": _to_text(column.get("generator_type")),
+                    "randomization_pct": _to_number(column.get("randomization_pct")),
+                    "expand_categories": bool(column.get("expand_categories", False)),
+                    "allowed_values": _parse_list_like(column.get("allowed_values"), max_items=8, max_len=30),
+                    "allowed_values_expanded": _parse_list_like(
+                        column.get("allowed_values_expanded"),
+                        max_items=10,
+                        max_len=30,
+                    ),
+                    "null_count": _to_number(column.get("null_count")),
+                    "cardinality": _to_number(column.get("cardinality")),
+                    "sd": _to_number(column.get("sd")),
+                    "variance": _to_number(column.get("variance")),
+                    "null_percent": _to_number(column.get("null_value_percent")),
+                    "min": _compact_value(column.get("min_val")),
+                    "max": _compact_value(column.get("max_val")),
+                }
+            )
+        sample_insights = _table_sample_insights(table) if idx < 3 else {}
+        compact_tables.append(
+            {
+                "name": _to_text(table.get("name")),
+                "row_count": _to_number(table.get("total_rows")) or _to_number(table.get("row_count")),
+                "column_count": len(table.get("columns", [])),
+                "pii_column_count": pii_count,
+                "columns": compact_columns,
+                "sample_insights": sample_insights,
+            }
+        )
+
+    compact_relations = [
+        {
+            "from_table": _to_text(rel.get("from_table")),
+            "from_column": _to_text(rel.get("from_column")),
+            "to_table": _to_text(rel.get("to_table")),
+            "to_column": _to_text(rel.get("to_column")),
+            "cardinality": _to_text(rel.get("cardinality")),
+            "is_optional": bool(rel.get("is_optional", True)),
+        }
+        for rel in relations[:24]
+    ]
+
     return {
         "project": {
             "name": _to_text((project or {}).get("name") or "unsaved project"),
             "source_type": _to_text((project or {}).get("source_type") or "unknown"),
         },
         "table_count": len(tables),
-        "tables": [
-            {
-                "name": _to_text(t.get("name")),
-                "column_count": len(t.get("columns", [])),
-                "columns": [
-                    {
-                        "name": _to_text(c.get("name")),
-                        "data_type": _to_text(c.get("data_type")),
-                        "is_pii": bool(c.get("is_pii", False)),
-                    }
-                    for c in t.get("columns", [])[:12]
-                ],
-            }
-            for t in tables[:8]
-        ],
+        "tables": compact_tables,
         "relation_count": len(relations),
+        "relations": compact_relations,
     }
 
 
@@ -217,8 +408,11 @@ def _build_prompt(
         "- If the user asks for a schema project with columns, keep them on Input so they can fill in schema details.\n"
         "- If the user asks where to upload a CSV while on Setup with CSV selected, move them to Input because the uploader lives there.\n"
         "- If the user asks to skip a step, move only to the next valid workflow step.\n"
-        "- If the request is unclear or outside the workflow, reply sorry im not allowed to do that or i donot have data about that and continue with the next workflow step instead of inventing a side task.\n"
+        "- If the request is unclear or outside the workflow, continue with the next workflow step instead of inventing a side task.\n"
         "- If the user asks a question, answer it directly in reply.\n"
+        "- If a requested field is missing, reply exactly in this style first: I could not find <field> for <table.column> in the current project metadata.\n"
+        "- After that missing-data line, guide the user to the next workflow step in one short sentence.\n"
+        "- Never invent missing numeric/profile values.\n"
         "- Keep reply under 90 words.\n"
         "- Do not mention JSON.\n"
         f"Current page: {current_page}\n"
@@ -333,6 +527,15 @@ async def infer_assistant_reply(
             current_page=current_page,
             has_project=has_project,
         )
+        missing_field = _is_missing_requested_data(message=message, project_context=project_context)
+        req_table_col = _extract_table_column(message)
+        if missing_field and req_table_col:
+            table_name, column_name = req_table_col
+            reply = (
+                f"I could not find {missing_field} for {table_name}.{column_name} in the current project metadata. "
+                f"Next step: go to {_next_step_text(current_page, has_project)} and continue the workflow."
+            )
+            action = heuristic_action
         if not reply:
             raise ValueError("Empty assistant reply")
         if not any(action.values()):

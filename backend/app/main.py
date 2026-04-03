@@ -1097,8 +1097,27 @@ async def assistant_chat(request: Request, payload=Body(...)):
                     table["columns"] = safe_df_to_dict(
                         conn.execute(
                             """
-                            SELECT c.id, c.name, c.data_type, c.is_pk, c.is_pii
+                            SELECT
+                                c.id,
+                                c.name,
+                                c.data_type,
+                                c.is_pk,
+                                c.is_nullable,
+                                c.is_pii,
+                                c.generator_type,
+                                c.randomization_pct,
+                                c.allowed_values,
+                                c.allowed_values_expanded,
+                                c.expand_categories,
+                                p.null_count,
+                                p.min_val,
+                                p.max_val,
+                                p.cardinality,
+                                p.sd,
+                                p.variance,
+                                p.null_value_percent
                             FROM columns c
+                            LEFT JOIN column_profiles p ON c.id = p.column_id
                             WHERE c.table_id = ?
                             """,
                             (table_id,),

@@ -21,7 +21,7 @@ from auth import (
 
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
 UI_TIMEZONE = os.getenv("UI_TIMEZONE", "Asia/Kolkata")
-
+UPLOAD_REQUEST_TIMEOUT = float(os.getenv("UPLOAD_REQUEST_TIMEOUT", "300"))
 
 def _patch_nicegui_process_pool_setup() -> None:
     original_setup = nicegui_run.setup
