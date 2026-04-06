@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import re
@@ -6,7 +7,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 from dotenv import load_dotenv
-from app.engine.llm_usage import extract_usage
+from app.engine.llm_usage import extract_usage, sum_usage
 
 load_dotenv()
 repo_env = Path(__file__).resolve().parents[3] / ".env"
@@ -15,6 +16,10 @@ if repo_env.exists():
 
 GROQ_API_URL = os.getenv("GROQ_API_URL", "https://api.groq.com/openai/v1/chat/completions")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+SEMANTIC_INFER_BATCH_SIZE = max(5, min(int(os.getenv("SEMANTIC_INFER_BATCH_SIZE", "24")), 50))
+SEMANTIC_INFER_MAX_RETRIES = max(0, min(int(os.getenv("SEMANTIC_INFER_MAX_RETRIES", "3")), 6))
+SEMANTIC_INFER_BACKOFF_BASE = max(0.2, float(os.getenv("SEMANTIC_INFER_BACKOFF_BASE", "0.8")))
+SEMANTIC_INFER_INTER_BATCH_DELAY = max(0.0, float(os.getenv("SEMANTIC_INFER_INTER_BATCH_DELAY", "1.0")))
 ALLOWED_GENERATORS = {"auto", "categorical", "integer", "numerical", "datetime"}
 
 
@@ -178,7 +183,40 @@ def _build_prompt(columns: List[Dict[str, Any]]) -> str:
     )
 
 
-async def infer_column_semantics(columns: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _should_retry_exception(ex: Exception) -> bool:
+    if isinstance(ex, httpx.HTTPStatusError):
+        code = ex.response.status_code
+        return code == 429 or 500 <= code < 600
+    return isinstance(ex, (httpx.TimeoutException, httpx.NetworkError))
+
+
+async def _post_groq_with_retry(*, api_key: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    attempts = SEMANTIC_INFER_MAX_RETRIES + 1
+    last_error: Optional[Exception] = None
+    for attempt in range(attempts):
+        try:
+            async with httpx.AsyncClient(timeout=45.0) as client:
+                resp = await client.post(
+                    GROQ_API_URL,
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                )
+                resp.raise_for_status()
+                return resp.json()
+        except Exception as ex:
+            last_error = ex
+            if attempt >= attempts - 1 or not _should_retry_exception(ex):
+                raise
+            await asyncio.sleep(SEMANTIC_INFER_BACKOFF_BASE * (2 ** attempt))
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Groq request failed without a captured exception")
+
+
+async def _infer_column_semantics_single(columns: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not columns:
         return {"source": "none", "model": None, "suggestions": []}
 
@@ -208,17 +246,7 @@ async def infer_column_semantics(columns: List[Dict[str, Any]]) -> Dict[str, Any
     }
 
     try:
-        async with httpx.AsyncClient(timeout=45.0) as client:
-            resp = await client.post(
-                GROQ_API_URL,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-            )
-            resp.raise_for_status()
-            data = resp.json()
+        data = await _post_groq_with_retry(api_key=api_key, payload=payload)
         usage = extract_usage(data)
     except Exception as ex:
         return {
@@ -288,4 +316,41 @@ async def infer_column_semantics(columns: List[Dict[str, Any]]) -> Dict[str, Any
         "model": GROQ_MODEL,
         "usage": usage,
         "suggestions": final_suggestions,
+    }
+
+
+async def infer_column_semantics(columns: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not columns:
+        return {"source": "none", "model": None, "suggestions": []}
+
+    if len(columns) <= SEMANTIC_INFER_BATCH_SIZE:
+        return await _infer_column_semantics_single(columns)
+
+    batches = [
+        columns[idx: idx + SEMANTIC_INFER_BATCH_SIZE]
+        for idx in range(0, len(columns), SEMANTIC_INFER_BATCH_SIZE)
+    ]
+    results: List[Dict[str, Any]] = []
+    for batch_index, batch in enumerate(batches):
+        results.append(await _infer_column_semantics_single(batch))
+        if batch_index < len(batches) - 1 and SEMANTIC_INFER_INTER_BATCH_DELAY > 0:
+            await asyncio.sleep(SEMANTIC_INFER_INTER_BATCH_DELAY)
+
+    suggestions: List[Dict[str, Any]] = []
+    errors: List[str] = []
+    for result in results:
+        suggestions.extend(list(result.get("suggestions") or []))
+        err = str(result.get("error") or "").strip()
+        if err:
+            errors.append(err)
+
+    source = "groq" if all(str(result.get("source")) == "groq" for result in results) else "heuristic"
+    model = GROQ_MODEL if any(str(result.get("model") or "").strip() for result in results) else None
+    error = " | ".join(dict.fromkeys(errors)) if errors else None
+    return {
+        "source": source,
+        "model": model,
+        "usage": sum_usage(result.get("usage") for result in results),
+        "suggestions": suggestions,
+        "error": error,
     }

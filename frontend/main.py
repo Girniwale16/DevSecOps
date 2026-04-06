@@ -24,6 +24,8 @@ UI_TIMEZONE = os.getenv("UI_TIMEZONE", "Asia/Kolkata")
 UPLOAD_REQUEST_TIMEOUT = float(os.getenv("UPLOAD_REQUEST_TIMEOUT", "300"))
 MAX_CSV_UPLOAD_MB = int(os.getenv("MAX_CSV_UPLOAD_MB", "50"))
 MAX_CSV_UPLOAD_BYTES = MAX_CSV_UPLOAD_MB * 1024 * 1024
+MAX_DDL_UPLOAD_MB = int(os.getenv("MAX_DDL_UPLOAD_MB", str(MAX_CSV_UPLOAD_MB)))
+MAX_DDL_UPLOAD_BYTES = MAX_DDL_UPLOAD_MB * 1024 * 1024
 
 def _patch_nicegui_process_pool_setup() -> None:
     original_setup = nicegui_run.setup
@@ -347,11 +349,10 @@ async def main_page() -> None:
             self.detail = detail
             super().__init__(f"HTTP {self.status_code}: {self.detail}")
 
-    # Start each frontend load as a fresh session.
-    app.storage.user["project_id"] = None
-    app.storage.user["active_page"] = "upload"
-    stored_project_id = None
-    initial_page = "upload"
+    stored_project_id = app.storage.user.get("project_id")
+    initial_page = str(app.storage.user.get("active_page") or "upload")
+    if initial_page not in {"upload", "input", "project", "modeling", "generate", "output", "admin"}:
+        initial_page = "upload"
 
     local_state: Dict[str, Any] = {
         "page": initial_page,
@@ -383,6 +384,8 @@ async def main_page() -> None:
         "is_inferring_semantics": False,
         "is_detecting_pii": False,
         "is_expanding_categories": False,
+        "is_modeling_autosave": False,
+        "modeling_autosave_pending": False,
         "project_summary": None,
         "is_loading_summary": False,
 
@@ -851,7 +854,7 @@ async def main_page() -> None:
         try:
             tip = element.tooltip(text)
             try:
-                tip.props('anchor="center left" self="center right" transition-show="jump-right" transition-hide="jump-left"')
+                tip.props('anchor="center left" self="center right" transition-show="jump-right" transition-hide="jump-left" max-width=320')
             except Exception:
                 pass
         except Exception:
@@ -866,6 +869,12 @@ async def main_page() -> None:
     def notify_csv_upload_rejected(_: Any = None) -> None:
         safe_notify(
             f"Upload failed: file exceeded the {MAX_CSV_UPLOAD_MB} MB CSV limit.",
+            notify_type="negative",
+        )
+
+    def notify_ddl_upload_rejected(_: Any = None) -> None:
+        safe_notify(
+            f"Upload failed: file exceeded the {MAX_DDL_UPLOAD_MB} MB DDL limit.",
             notify_type="negative",
         )
 
@@ -1048,10 +1057,10 @@ async def main_page() -> None:
 
         page = assistant_current_page()
         selected_mode = str(local_state.get("setup_mode") or "").strip().lower()
-        mode_titles = {"csv": "CSV Ingestion", "schema": "Schema Studio"}
+        mode_titles = {"csv": "CSV Ingestion", "ddl": "DDL Blueprint", "schema": "Schema Studio"}
         current_mode = mode_titles.get(selected_mode)
         if page == "upload":
-            text = "Hello, how may I help you? We can get started with CSV Ingestion or Schema Studio."
+            text = "Hello, how may I help you? We can get started with CSV Ingestion, DDL Blueprint, or Schema Studio."
             if current_mode and not local_state.get("assistant_fresh_start"):
                 text = f"Hello, how may I help you? You are on {assistant_page_title()} and {current_mode} is ready to continue."
             return [
@@ -1272,6 +1281,15 @@ async def main_page() -> None:
                 "source": "local",
                 "model": None,
             }
+        if page == "upload" and "ddl" in lowered and any(token in lowered for token in ["upload", "use", "select", "choose"]):
+            select_setup_mode("ddl")
+            assistant_set_page("input")
+            return {
+                "reply": "I opened DDL Blueprint. Please upload your SQL DDL file below.",
+                "action": {},
+                "source": "local",
+                "model": None,
+            }
 
         requested_columns_match = re.search(r"(\d+)\s+columns?", lowered)
         asks_for_schema_start = any(
@@ -1286,6 +1304,10 @@ async def main_page() -> None:
             "use csv",
             "select csv",
             "choose csv",
+            "upload ddl",
+            "use ddl",
+            "select ddl",
+            "choose ddl",
             "use schema",
             "select schema",
             "choose schema",
@@ -1570,11 +1592,20 @@ async def main_page() -> None:
                     "action": {"setup_mode": "schema", "target_page": "input"},
                 }
             )
+            actions.append(
+                {
+                    "label": "DDL Blueprint (Selected)" if selected_mode == "ddl" and not fresh_start else "DDL Blueprint",
+                    "action": {"setup_mode": "ddl", "target_page": "input"},
+                }
+            )
         elif page == "input":
             actions.append({"label": "Go Back", "action": {"target_page": "upload"}})
             if selected_mode == "csv":
                 if bool(local_state.get("project_id")) and local_state.get("multi_csv_inflight", 0) == 0:
                     actions.append({"label": "Upload Another File", "action": {}})
+                    actions.append({"label": "Continue", "action": {"target_page": "project"}})
+            elif selected_mode == "ddl":
+                if bool(local_state.get("project_id")):
                     actions.append({"label": "Continue", "action": {"target_page": "project"}})
             elif selected_mode == "schema":
                 if bool(local_state.get("project_id")):
@@ -1588,7 +1619,7 @@ async def main_page() -> None:
         elif page == "modeling":
             actions.append({"label": "Go Back", "action": {"target_page": "project"}})
             if bool(local_state.get("project_id")) and not local_state.get("is_inferring_semantics"):
-                actions.append({"label": "Infer Semantics", "action": {"operation": "infer_semantics"}})
+                actions.append({"label": "Auto Configure (AI)", "action": {"operation": "auto_configure"}})
             if bool(local_state.get("project_id")):
                 actions.append({"label": "Go to Generate", "action": {"target_page": "generate"}})
         elif page == "generate":
@@ -1648,6 +1679,8 @@ async def main_page() -> None:
             return "Refreshing the dependency plan."
         if operation == "infer_semantics":
             return "Running semantic inference on your columns."
+        if operation == "auto_configure":
+            return "Running semantic inference and PII detection for your columns."
         if operation == "launch_generation_sample":
             return "Generating a 50-row sample preview for you to review."
         if operation == "approve_sample":
@@ -1661,6 +1694,8 @@ async def main_page() -> None:
             return "CSV selected. Upload your file below to create the workspace."
         if target_page == "input" and setup_mode == "schema":
             return "Schema Studio selected. Define tables and columns below, then create the workspace."
+        if target_page == "input" and setup_mode == "ddl":
+            return "DDL Blueprint selected. Upload your SQL DDL file below to create the workspace."
         if not target_page and not operation and setup_mode == "csv":
             return "CSV mode is ready. Upload your next file below whenever you are ready."
         if target_page == "project":
@@ -1688,7 +1723,11 @@ async def main_page() -> None:
                 normalized["setup_mode"] = "schema"
                 normalized["target_page"] = "input"
                 return normalized
-            if setup_mode in {"csv", "schema"} and not target_page:
+            if "ddl" in lowered and any(token in lowered for token in ["upload", "use", "select", "choose"]):
+                normalized["setup_mode"] = "ddl"
+                normalized["target_page"] = "input"
+                return normalized
+            if setup_mode in {"csv", "schema", "ddl"} and not target_page:
                 normalized["target_page"] = "input"
             elif not setup_mode and not target_page:
                 if "csv" in lowered and any(token in lowered for token in ["upload", "use", "select", "choose"]):
@@ -1696,6 +1735,9 @@ async def main_page() -> None:
                     normalized["target_page"] = "input"
                 elif "schema" in lowered and any(token in lowered for token in ["use", "select", "choose", "create"]):
                     normalized["setup_mode"] = "schema"
+                    normalized["target_page"] = "input"
+                elif "ddl" in lowered and any(token in lowered for token in ["upload", "use", "select", "choose"]):
+                    normalized["setup_mode"] = "ddl"
                     normalized["target_page"] = "input"
             if str(local_state.get("setup_mode") or "") == "csv" and any(token in lowered for token in ["where should i upload", "where do i upload", "where can i upload", "how do i upload", "upload where"]):
                 normalized["target_page"] = "input"
@@ -1707,7 +1749,7 @@ async def main_page() -> None:
         target_page = str(action.get("target_page") or "").strip().lower()
         operation = str(action.get("operation") or "").strip().lower()
 
-        if setup_mode in {"csv", "schema"}:
+        if setup_mode in {"csv", "schema", "ddl"}:
             select_setup_mode(setup_mode)
         if target_page in {"upload", "input", "project", "modeling", "generate", "output"}:
             if local_state.get("assistant_mode_active"):
@@ -1720,6 +1762,8 @@ async def main_page() -> None:
             asyncio.create_task(refresh_generation_plan())
         elif operation == "infer_semantics":
             asyncio.create_task(infer_semantics_with_ai())
+        elif operation == "auto_configure":
+            asyncio.create_task(auto_configure_modeling_with_ai())
         elif operation == "launch_generation_sample":
             asyncio.create_task(start_generation(sample_only=True))
         elif operation == "approve_sample":
@@ -2023,7 +2067,7 @@ async def main_page() -> None:
             return
         try:
             async with api_client(timeout=30.0) as client:
-                resp = await client.get(f"{BACKEND_URL}/task/{task_id}/preview", params={"rows": 5})
+                resp = await client.get(f"{BACKEND_URL}/task/{task_id}/preview", params={"rows": 50})
                 data = await parse_response(resp)
             local_state["sample_preview_tables"] = list(data.get("tables") or [])
             local_state["sample_preview_error"] = None
@@ -2031,8 +2075,7 @@ async def main_page() -> None:
             local_state["sample_preview_tables"] = []
             local_state["sample_preview_error"] = str(ex)
         finally:
-            safe_refresh(generate_view)
-            safe_refresh(assistant_widget)
+            refresh_task_views()
 
     async def refresh_project_summary(show_notify: bool = False) -> None:
         if not local_state["project_id"]:
@@ -2141,11 +2184,30 @@ async def main_page() -> None:
                                     delete_btn.classes("justify-self-center")
                                     delete_btn.on_click(lambda _, row_no=row["no"]: asyncio.create_task(delete_uploaded_table(row_no)))
                                     delete_btn.set_enabled(str(row.get("status", "")) == "Uploaded")
+        elif page == "input" and setup_mode == "ddl":
+            with ui.card().classes("w-full bg-slate-50 border border-slate-200 rounded-xl p-4 shadow-none"):
+                ui.label("Chat Flow: DDL Blueprint").classes("text-sm font-bold text-slate-700")
+                ui.label("Upload SQL DDL here to create the workspace from schema structure.").classes("text-xs text-slate-500 mb-3")
+                dialect_select = ui.select(
+                    ["postgres", "mysql", "sqlite", "sqlserver", "oracle"],
+                    label="DDL dialect",
+                ).bind_value(local_state, "dialect").classes("w-full max-w-xs mb-3")
+                attach_tooltip(dialect_select, "Select the SQL dialect that best matches your DDL file so parsing can apply the right syntax rules.")
+                ddl_upload = ui.upload(on_upload=handle_ddl_upload, label="Drop DDL file", auto_upload=True).props(
+                    f"accept=.sql,text/plain,application/sql max-file-size={MAX_DDL_UPLOAD_BYTES}"
+                ).classes("w-full upload-zone")
+                ddl_upload.on("rejected", notify_ddl_upload_rejected)
+                attach_tooltip(ddl_upload, "Upload a SQL DDL file to create tables, columns, and relationships directly from schema definitions.")
+                ui.label(f"Maximum DDL size: {MAX_DDL_UPLOAD_MB} MB").classes("text-xs text-slate-500 mt-2")
+                ui.label("Once the DDL is parsed, continue to Workspace to review the generated tables and relationships.").classes(
+                    "text-xs text-slate-500 mt-2"
+                )
         elif page == "input" and setup_mode == "schema":
             with ui.card().classes("w-full bg-slate-50 border border-slate-200 rounded-xl p-4 shadow-none"):
                 ui.label("Chat Flow: Schema Studio").classes("text-sm font-bold text-slate-700")
                 ui.label("Build schema manually here and create the workspace when ready.").classes("text-xs text-slate-500 mb-3")
-                ui.input("Project name (optional)").bind_value(local_state, "schema_project_name").classes("w-full mb-3")
+                project_name_input = ui.input("Project name (optional)").bind_value(local_state, "schema_project_name").classes("w-full mb-3")
+                attach_tooltip(project_name_input, "Optional label for this schema project. Leave blank to use an auto-generated name.")
 
                 with ui.row().classes("w-full items-center justify-between gap-2 mb-2"):
                     ui.label("Tables").classes("text-xs font-bold uppercase tracking-wide text-slate-500")
@@ -2180,20 +2242,25 @@ async def main_page() -> None:
                             with ui.card().classes("w-full bg-slate-50 border border-slate-200 rounded-lg p-3 shadow-none mb-2"):
                                 ui.input("Column name *").bind_value(col, "name").classes("w-full mb-2")
                                 with ui.row().classes("w-full gap-2 flex-wrap"):
-                                    ui.select(SCHEMA_TYPE_OPTIONS, label="Type").bind_value(col, "data_type").classes("w-40")
-                                    ui.select(
+                                    schema_type_input = ui.select(SCHEMA_TYPE_OPTIONS, label="Type").bind_value(col, "data_type").classes("w-40")
+                                    generator_select = ui.select(
                                         ["auto", "categorical", "integer", "numerical", "datetime"],
                                         label="Generator",
                                     ).bind_value(col, "generator_type").classes("w-44")
-                                ui.input("Allowed Values", placeholder="e.g. Sales, HR, Finance or one per line").bind_value(col, "allowed_values").classes("w-full mt-2")
+                                if _column_supports_allowed_values(col):
+                                    allowed_values_input = ui.input("Allowed Values", placeholder="e.g. Sales, HR, Finance or one per line").bind_value(col, "allowed_values").classes("w-full mt-2")
+                                    attach_tooltip(allowed_values_input, _allowed_values_tooltip(col))
                                 ui.input("Description").bind_value(col, "description").classes("w-full mt-2")
                                 with ui.row().classes("w-full items-center justify-between gap-2 mt-2 flex-wrap"):
                                     with ui.row().classes("gap-3 flex-wrap"):
                                         ui.checkbox("Mandatory").bind_value(col, "mandatory")
                                         ui.checkbox("Unique").bind_value(col, "is_unique")
-                                        ui.checkbox("Expand Categories").bind_value(col, "expand_categories")
+                                        expand_box = ui.checkbox("Expand Categories").bind_value(col, "expand_categories")
                                     rm_col_btn = ui.button(icon="delete", on_click=lambda _, ti=active_index, ci=c_idx: remove_schema_column(ti, ci)).props("flat dense round color=negative size=sm")
                                     rm_col_btn.set_enabled(len(active_table.get("columns", [])) > 1)
+                                schema_type_input.on_value_change(lambda _, c=col, cb=expand_box: on_schema_type_changed(c, cb))
+                                generator_select.on_value_change(lambda _, c=col, cb=expand_box: on_schema_generator_changed(c, cb))
+                                sync_expand_checkbox(col, expand_box)
                         with ui.row().classes("w-full justify-between items-center gap-2 mt-2 flex-wrap"):
                             action_button("Add Column", icon="add", on_click=lambda ti=active_index: add_schema_column(ti), variant="outline", compact=True)
                             create_btn = action_button(
@@ -2206,8 +2273,14 @@ async def main_page() -> None:
                             create_btn.set_enabled(not local_state.get("is_submitting_schema"))
         elif page == "project":
             with ui.card().classes("w-full bg-slate-50 border border-slate-200 rounded-xl p-4 shadow-none"):
-                ui.label("Chat Flow: Workspace").classes("text-sm font-bold text-slate-700")
-                if local_state.get("is_loading_summary"):
+                with ui.row().classes("items-center gap-2"):
+                    ui.label("Chat Flow: Workspace").classes("text-sm font-bold text-slate-700")
+                    inline_info_icon("Review project summary, tables, profiles, and relationships before moving to Modeling.")
+                if local_state.get("is_loading_project") and not local_state.get("project_data"):
+                    with ui.row().classes("items-center gap-2 text-slate-600"):
+                        ui.spinner(size="sm")
+                        ui.label("Loading workspace...")
+                elif local_state.get("is_loading_summary"):
                     ui.label("Refreshing summary...").classes("text-xs text-slate-500")
                 elif (local_state.get("project_summary") or {}).get("summary"):
                     ui.label(local_state["project_summary"]["summary"]).classes("text-sm text-slate-700")
@@ -2264,29 +2337,26 @@ async def main_page() -> None:
                         ui.mermaid(mermaid).classes("w-full h-56")
         elif page == "modeling":
             with ui.card().classes("w-full bg-slate-50 border border-slate-200 rounded-xl p-4 shadow-none"):
-                ui.label("Chat Flow: Modeling").classes("text-sm font-bold text-slate-700")
-                if not local_state.get("project_data"):
+                with ui.row().classes("items-center gap-2"):
+                    ui.label("Chat Flow: Modeling").classes("text-sm font-bold text-slate-700")
+                    inline_info_icon("Refine column types, privacy flags, generators, and table relationships before generation.")
+                if local_state.get("is_loading_project") and not local_state.get("project_data"):
+                    with ui.row().classes("items-center gap-2 text-slate-600"):
+                        ui.spinner(size="sm")
+                        ui.label("Loading modeling workspace...")
+                elif not local_state.get("project_data"):
                     ui.label("Load a workspace first to edit modeling settings.").classes("text-sm text-slate-500")
                 else:
                     with ui.row().classes("w-full items-center justify-between gap-2 mb-2 flex-wrap"):
                         with ui.row().classes("items-center gap-2 flex-wrap"):
-                            pii_btn = action_button(
-                                "Auto Detect PII",
-                                icon="privacy_tip",
-                                on_click=detect_pii_with_ai,
-                                variant="danger",
-                                compact=True,
-                            )
-                            pii_btn.set_enabled(not local_state["is_detecting_pii"])
                             infer_btn = action_button(
-                                "Auto Infer (AI)",
+                                "Auto Configure (AI)",
                                 icon="auto_awesome",
-                                on_click=infer_semantics_with_ai,
+                                on_click=auto_configure_modeling_with_ai,
                                 variant="warning",
                                 compact=True,
                             )
-                            infer_btn.set_enabled(not local_state["is_inferring_semantics"])
-                            action_button("Save Blueprint", icon="save", on_click=save_modeling, variant="success", compact=True)
+                            infer_btn.set_enabled(not local_state["is_inferring_semantics"] and not local_state["is_detecting_pii"])
                             action_button(
                                 "Go to Generate",
                                 icon="arrow_forward",
@@ -2298,7 +2368,9 @@ async def main_page() -> None:
                         with ui.column().classes("w-full gap-3"):
                             for table in local_state["project_data"].get("tables", []):
                                 render_modeling_table_editor(table, compact=True)
-                    ui.label("Relationship Studio").classes("text-xs font-bold uppercase tracking-wide text-slate-500 mt-3")
+                    with ui.row().classes("items-center gap-2 mt-3"):
+                        ui.label("Relationship Studio").classes("text-xs font-bold uppercase tracking-wide text-slate-500")
+                        inline_info_icon("Use this studio to define table-to-table relationships only. AI inference excludes same-table column associations and keeps only cross-table links.")
                     tables = table_names_in_project()
                     if len(tables) <= 1:
                         ui.label("Add at least two tables to define relationships.").classes("text-sm text-slate-500 italic")
@@ -2536,6 +2608,12 @@ async def main_page() -> None:
         safe_refresh(admin_view)
         safe_refresh(assistant_widget)
 
+    def refresh_task_views() -> None:
+        safe_refresh(nav_bar)
+        safe_refresh(generate_view)
+        safe_refresh(output_view)
+        safe_refresh(assistant_widget)
+
     async def handle_csv_upload(e: events.UploadEventArguments) -> None:
         if not local_state["project_id"]:
             local_state["uploaded_tables"] = []
@@ -2627,6 +2705,9 @@ async def main_page() -> None:
     async def handle_ddl_upload(e: events.UploadEventArguments) -> None:
         try:
             content = await e.file.read()
+            if len(content) > MAX_DDL_UPLOAD_BYTES:
+                safe_notify(f"DDL file size must be {MAX_DDL_UPLOAD_MB} MB or smaller.", notify_type="negative")
+                return
             files = {"file": (e.file.name, content, "application/sql")}
             params = {"dialect": local_state["dialect"]}
             async with api_client(timeout=60.0) as client:
@@ -2839,6 +2920,35 @@ async def main_page() -> None:
                 safe_notify(f"Blueprint save failed: {ex}", notify_type="negative")
             return False
 
+    async def run_modeling_autosave() -> None:
+        if not local_state.get("project_id") or not local_state.get("project_data"):
+            return
+        if local_state.get("is_modeling_autosave"):
+            local_state["modeling_autosave_pending"] = True
+            return
+        local_state["is_modeling_autosave"] = True
+        try:
+            await save_modeling(notify=False)
+        finally:
+            local_state["is_modeling_autosave"] = False
+            if local_state.get("modeling_autosave_pending"):
+                local_state["modeling_autosave_pending"] = False
+                asyncio.create_task(run_modeling_autosave())
+
+    def queue_modeling_autosave() -> None:
+        if not local_state.get("project_id") or not local_state.get("project_data"):
+            return
+        asyncio.create_task(run_modeling_autosave())
+
+    async def auto_configure_modeling_with_ai() -> None:
+        if not local_state["project_id"]:
+            safe_notify("Load a project first.", notify_type="warning")
+            return
+        if local_state["is_inferring_semantics"] or local_state["is_detecting_pii"]:
+            return
+        await infer_semantics_with_ai()
+        await detect_pii_with_ai()
+
     async def infer_semantics_with_ai() -> None:
         if not local_state["project_id"]:
             safe_notify("Load a project first.", notify_type="warning")
@@ -2986,8 +3096,8 @@ async def main_page() -> None:
                         asyncio.create_task(fetch_sample_preview(local_state.get("task_id")))
                         if local_state.get("task_file_url"):
                             local_state["pending_download_url"] = local_state["task_file_url"]
-                refresh_all()
                 if local_state["task_status"] in {"done", "failed"}:
+                    refresh_task_views()
                     break
                 await asyncio.sleep(2)
             except Exception as ex:
@@ -2995,7 +3105,7 @@ async def main_page() -> None:
                 if failures > 5:
                     local_state["task_status"] = "failed"
                     local_state["task_logs"].append(f"Polling stopped: {ex}")
-                    refresh_all()
+                    refresh_task_views()
                     break
                 await asyncio.sleep(3)
 
@@ -3121,6 +3231,7 @@ async def main_page() -> None:
             col["allowed_values"] = ""
             col["allowed_values_expanded"] = ""
         sync_expand_checkbox(col, expand_box)
+        queue_modeling_autosave()
         safe_refresh(modeling_view)
         safe_refresh(assistant_widget)
 
@@ -3129,7 +3240,23 @@ async def main_page() -> None:
             col["allowed_values"] = ""
             col["allowed_values_expanded"] = ""
         sync_expand_checkbox(col, expand_box)
+        queue_modeling_autosave()
         safe_refresh(modeling_view)
+        safe_refresh(assistant_widget)
+
+    def on_schema_type_changed(col: Dict[str, Any], expand_box: Any) -> None:
+        col["data_type"] = normalize_data_type_value(col.get("data_type"))
+        if not _column_supports_allowed_values(col):
+            col["allowed_values"] = ""
+        sync_expand_checkbox(col, expand_box)
+        safe_refresh(input_view)
+        safe_refresh(assistant_widget)
+
+    def on_schema_generator_changed(col: Dict[str, Any], expand_box: Any) -> None:
+        if not _column_supports_allowed_values(col):
+            col["allowed_values"] = ""
+        sync_expand_checkbox(col, expand_box)
+        safe_refresh(input_view)
         safe_refresh(assistant_widget)
 
 
@@ -3167,13 +3294,14 @@ async def main_page() -> None:
             with ui.row().classes(f"{date_stat_class} items-end no-wrap gap-1"):
                 date_input = ui.input(label, value=initial).classes("grow min-w-0")
                 date_input.props("dense")
-                date_input.on_value_change(lambda e, c=col, k=key: c.__setitem__(k, str(e.value or "").strip()))
+                date_input.on_value_change(lambda e, c=col, k=key: (c.__setitem__(k, str(e.value or "").strip()), queue_modeling_autosave()))
                 with ui.menu() as picker_menu:
                     picker = ui.date(value=initial or None).props("mask=YYYY-MM-DD")
                     picker.on_value_change(
                         lambda e, c=col, k=key, inp=date_input, m=picker_menu: (
                             c.__setitem__(k, str(e.value or "").strip()),
                             inp.set_value(str(e.value or "").strip()),
+                            queue_modeling_autosave(),
                             m.close(),
                         )
                     )
@@ -3200,8 +3328,10 @@ async def main_page() -> None:
                                     ui.label(col["name"]).classes("font-semibold text-slate-700")
                                     ui.label(col.get("data_type") or "UNKNOWN").classes("text-xs text-slate-400")
                                 with ui.row().classes("items-start gap-4 flex-wrap flex-1 min-w-[320px]"):
-                                    ui.checkbox("PII").bind_value(col, "is_pii")
+                                    pii_box = ui.checkbox("PII").bind_value(col, "is_pii")
+                                    pii_box.on("update:model-value", lambda _, c=col: queue_modeling_autosave())
                                     expand_box = ui.checkbox("Expand").bind_value(col, "expand_categories")
+                                    expand_box.on("update:model-value", lambda _, c=col: queue_modeling_autosave())
                                     type_select = ui.select(SCHEMA_TYPE_OPTIONS, label="Type").bind_value(col, "data_type").classes("w-36")
                                     generator_select = ui.select(
                                         ["auto", "categorical", "integer", "numerical", "datetime"],
@@ -3215,6 +3345,7 @@ async def main_page() -> None:
                                             "Allowed Values",
                                             placeholder="e.g. Sales, HR, Finance or one per line",
                                         ).bind_value(col, "allowed_values").classes(width_class)
+                                        allowed_values_input.on("update:model-value", lambda _, c=col: queue_modeling_autosave())
                                         attach_tooltip(
                                             allowed_values_input,
                                             _allowed_values_tooltip(col),
@@ -3222,16 +3353,18 @@ async def main_page() -> None:
                                     elif _column_is_datetime(col):
                                         with ui.column().classes("gap-1"):
                                             output_format_input = ui.input(
-                                                "Output Format",
-                                                placeholder=_datetime_output_format_placeholder(col),
-                                            ).bind_value(col, "output_format").classes(width_class)
-                                            attach_tooltip(output_format_input, _datetime_output_format_tooltip(col))
-                                            ui.label(
-                                                f"Example: {_datetime_output_format_placeholder(col)}"
-                                            ).classes("text-[11px] text-slate-400")
+                                            "Output Format",
+                                            placeholder=_datetime_output_format_placeholder(col),
+                                        ).bind_value(col, "output_format").classes(width_class)
+                                        output_format_input.on("update:model-value", lambda _, c=col: queue_modeling_autosave())
+                                        attach_tooltip(output_format_input, _datetime_output_format_tooltip(col))
+                                        ui.label(
+                                            f"Example: {_datetime_output_format_placeholder(col)}"
+                                        ).classes("text-[11px] text-slate-400")
 
                             with ui.row().classes("w-full items-center gap-2 mt-1 flex-wrap"):
-                                ui.number("Null %", format="%.2f").bind_value(col, "null_value_percent").classes(stat_class)
+                                null_input = ui.number("Null %", format="%.2f").bind_value(col, "null_value_percent").classes(stat_class)
+                                null_input.on("update:model-value", lambda _, c=col: queue_modeling_autosave())
                                 is_numeric = _column_is_numeric(col)
                                 is_datetime = _column_is_datetime(col)
                                 if is_numeric:
@@ -3239,6 +3372,8 @@ async def main_page() -> None:
                                     max_input = ui.number("Max").bind_value(col, "max_val").classes(stat_class)
                                     sd_input = ui.number("Std Dev", format="%.4f").bind_value(col, "sd").classes(variance_class)
                                     var_input = ui.number("Variance", format="%.4f").bind_value(col, "variance").classes(variance_class)
+                                    for field in (min_input, max_input, sd_input, var_input):
+                                        field.on("update:model-value", lambda _, c=col: queue_modeling_autosave())
                                     for field in (min_input, max_input, sd_input, var_input):
                                         field.set_enabled(True)
                                 elif is_datetime:
@@ -3730,9 +3865,11 @@ async def main_page() -> None:
                         ["postgres", "mysql", "sqlite", "sqlserver", "oracle"],
                         label="DDL dialect",
                     ).bind_value(local_state, "dialect").classes("w-full max-w-xs mb-3")
-                    ui.upload(on_upload=handle_ddl_upload, label="Drop DDL file", auto_upload=True).props(
-                        "accept=.sql,text/plain,application/sql"
+                    ddl_upload = ui.upload(on_upload=handle_ddl_upload, label="Drop DDL file", auto_upload=True).props(
+                        f"accept=.sql,text/plain,application/sql max-file-size={MAX_DDL_UPLOAD_BYTES}"
                     ).classes("w-full upload-zone")
+                    ddl_upload.on("rejected", notify_ddl_upload_rejected)
+                    ui.label(f"Maximum DDL size: {MAX_DDL_UPLOAD_MB} MB").classes("text-xs text-slate-500 mt-2")
                     ui.label("Best when the schema already exists and source CSV files are not available.").classes("text-xs text-slate-400 mt-3")
 
             else:
@@ -3849,7 +3986,8 @@ async def main_page() -> None:
                                                         attach_tooltip(unique_box, "Turn this on when every generated value should be distinct, such as order numbers, usernames, or reference codes.")
                                                         expand_box = ui.checkbox("Expand Categories").bind_value(col, "expand_categories")
                                                         attach_tooltip(expand_box, "Use AI or fallback expansion to widen the allowed-values list for categorical columns before generation.")
-                                                        generator_select.on_value_change(lambda _, c=col, cb=expand_box: sync_expand_checkbox(c, cb))
+                                                        schema_type_input.on_value_change(lambda _, c=col, cb=expand_box: on_schema_type_changed(c, cb))
+                                                        generator_select.on_value_change(lambda _, c=col, cb=expand_box: on_schema_generator_changed(c, cb))
                                                         sync_expand_checkbox(col, expand_box)
                                                 rm_col_btn = ui.button(icon="delete").props("flat dense round color=negative size=sm")
                                                 attach_tooltip(rm_col_btn, "Remove this column from the table.")
@@ -3902,8 +4040,10 @@ async def main_page() -> None:
 
             with ui.card().classes("glass-panel p-5"):
                 with ui.row().classes("w-full items-center justify-between gap-2 mb-2"):
-                    summary_hdr = ui.label("Project Summary").classes("text-sm font-bold text-slate-700")
-                    attach_tooltip(summary_hdr, "High-level AI summary of the current project structure and intent.")
+                    with ui.row().classes("items-center gap-2"):
+                        summary_hdr = ui.label("Project Summary").classes("text-sm font-bold text-slate-700")
+                        attach_tooltip(summary_hdr, "High-level AI summary of the current project structure and intent.")
+                        inline_info_icon("High-level AI summary of the current project structure and intent.")
                     refresh_summary_btn = action_button(
                         "Refresh AI Summary",
                         icon="auto_awesome",
@@ -3924,16 +4064,22 @@ async def main_page() -> None:
 
             with ui.row().classes("w-full gap-3 flex-wrap"):
                 with ui.card().classes("glass-panel p-4 min-w-40"):
-                    tables_hdr = ui.label("Tables").classes("text-xs text-slate-500")
-                    attach_tooltip(tables_hdr, "Total number of tables currently detected in this project.")
+                    with ui.row().classes("items-center gap-1"):
+                        tables_hdr = ui.label("Tables").classes("text-xs text-slate-500")
+                        attach_tooltip(tables_hdr, "Total number of tables currently detected in this project.")
+                        inline_info_icon("Total number of tables currently detected in this project.")
                     ui.label(str(len(tables))).classes("text-h5 font-extrabold")
                 with ui.card().classes("glass-panel p-4 min-w-40"):
-                    relations_hdr = ui.label("Relations").classes("text-xs text-slate-500")
-                    attach_tooltip(relations_hdr, "Number of table-to-table relationships detected or defined.")
+                    with ui.row().classes("items-center gap-1"):
+                        relations_hdr = ui.label("Relations").classes("text-xs text-slate-500")
+                        attach_tooltip(relations_hdr, "Number of table-to-table relationships detected or defined.")
+                        inline_info_icon("Number of table-to-table relationships detected or defined.")
                     ui.label(str(len(relations))).classes("text-h5 font-extrabold")
                 with ui.card().classes("glass-panel p-4 min-w-40"):
-                    source_hdr = ui.label("Source").classes("text-xs text-slate-500")
-                    attach_tooltip(source_hdr, "Project source type, such as CSV ingestion or schema studio.")
+                    with ui.row().classes("items-center gap-1"):
+                        source_hdr = ui.label("Source").classes("text-xs text-slate-500")
+                        attach_tooltip(source_hdr, "Project source type, such as CSV ingestion, DDL blueprint, or schema studio.")
+                        inline_info_icon("Project source type, such as CSV ingestion, DDL blueprint, or schema studio.")
                     ui.label(str(project.get("source_type", "UNKNOWN"))).classes("text-h6 font-bold")
 
             with ui.row().classes("w-full gap-4 flex-wrap"):
@@ -3941,8 +4087,10 @@ async def main_page() -> None:
                     names = [t["name"] for t in tables]
                     if names and local_state["selected_table"] not in names:
                         local_state["selected_table"] = names[0]
-                    data_profile_hdr = ui.label("Data Profile").classes("text-lg font-bold mb-2").style("color: var(--nexus-brand);")
-                    attach_tooltip(data_profile_hdr, "Column-level profile for the selected table.")
+                    with ui.row().classes("items-center gap-2 mb-2"):
+                        data_profile_hdr = ui.label("Data Profile").classes("text-lg font-bold").style("color: var(--nexus-brand);")
+                        attach_tooltip(data_profile_hdr, "Column-level profile for the selected table.")
+                        inline_info_icon("Column-level profile for the selected table.")
                     ui.select(
                         names,
                         value=local_state["selected_table"],
@@ -3969,6 +4117,7 @@ async def main_page() -> None:
                                 asyncio.create_task(refresh_correlations(str(selected.get("id") or "")))
                             ui.separator().classes("my-3 opacity-30")
                             corr_exp = ui.expansion("Correlation (numeric columns)", value=False).classes("w-full")
+                            attach_tooltip(corr_exp, "Linear correlation between numeric columns in the selected table.")
                             with corr_exp:
                                 with ui.row().classes("w-full justify-end mb-2"):
                                     inline_info_icon("Linear correlation between numeric columns in the selected table.")
@@ -3995,6 +4144,7 @@ async def main_page() -> None:
 
                             ui.separator().classes("my-3 opacity-30")
                             assoc_exp = ui.expansion("Same-table Associations (categorical)", value=False).classes("w-full")
+                            attach_tooltip(assoc_exp, "Association strength between categorical columns in the same table.")
                             with assoc_exp:
                                 with ui.row().classes("w-full justify-end mb-2"):
                                     inline_info_icon("Association strength between categorical columns in the same table.")
@@ -4022,6 +4172,7 @@ async def main_page() -> None:
 
                             ui.separator().classes("my-3 opacity-30")
                             llm_assoc_exp = ui.expansion("LLM Associations (same table)", value=False).classes("w-full")
+                            attach_tooltip(llm_assoc_exp, "LLM-inferred semantic relationships between columns in the selected table.")
                             with llm_assoc_exp:
                                 with ui.row().classes("w-full justify-end mb-2"):
                                     inline_info_icon("LLM-inferred semantic relationships between columns in the selected table.")
@@ -4069,6 +4220,10 @@ async def main_page() -> None:
     def modeling_view() -> None:
         if local_state["page"] != "modeling":
             return
+        if local_state["is_loading_project"] and not local_state["project_data"]:
+            with ui.row().classes("w-full justify-center py-24"):
+                ui.spinner(size="lg")
+            return
         if not local_state["project_data"]:
             ui.label("No project loaded.").classes("text-slate-500")
             return
@@ -4091,30 +4246,25 @@ async def main_page() -> None:
                     ui.spinner(size="sm")
                     ui.label("Expanding categorical values...")
 
-            with ui.expansion("1) Column Configuration", value=True).classes("glass-panel p-2 w-full"):
+            col_cfg_exp = ui.expansion("1) Column Configuration", value=True).classes("glass-panel p-2 w-full")
+            attach_tooltip(col_cfg_exp, "Refine column semantics, privacy flags, generator choices, and column-level modeling settings.")
+            with col_cfg_exp:
                 ui.label("Refine column semantics, privacy flags, and generation strategy.").classes("text-xs text-slate-500 mb-2")
                 with ui.row().classes("w-full items-center justify-between gap-2 mb-3 flex-wrap"):
-                    ui.label(
-                        f"Tables in project: {len(local_state['project_data']['tables'])}"
-                    ).classes("text-sm font-semibold text-slate-600")
                     with ui.row().classes("items-center gap-2"):
-                        pii_btn = action_button(
-                            "Auto Detect PII",
-                            icon="privacy_tip",
-                            on_click=detect_pii_with_ai,
-                            variant="danger",
-                            compact=True,
-                        )
-                        pii_btn.set_enabled(not local_state["is_detecting_pii"])
+                        ui.label(
+                            f"Tables in project: {len(local_state['project_data']['tables'])}"
+                        ).classes("text-sm font-semibold text-slate-600")
+                        inline_info_icon("Each table below exposes editable modeling rules for its columns.")
+                    with ui.row().classes("items-center gap-2"):
                         infer_btn = action_button(
-                            "Auto Infer (AI)",
+                            "Auto Configure (AI)",
                             icon="auto_awesome",
-                            on_click=infer_semantics_with_ai,
+                            on_click=auto_configure_modeling_with_ai,
                             variant="warning",
                             compact=True,
                         )
-                        infer_btn.set_enabled(not local_state["is_inferring_semantics"])
-                        action_button("Save Blueprint", icon="save", on_click=save_modeling, variant="success", compact=True)
+                        infer_btn.set_enabled(not local_state["is_inferring_semantics"] and not local_state["is_detecting_pii"])
                         action_button(
                             "Go to Generate",
                             icon="arrow_forward",
@@ -4131,7 +4281,9 @@ async def main_page() -> None:
                 else:
                     ui.label("No table selected.").classes("text-sm text-slate-500")
 
-            with ui.expansion("2) Relationship Studio", value=True).classes("glass-panel p-2 w-full"):
+            rel_exp = ui.expansion("2) Relationship Studio", value=True).classes("glass-panel p-2 w-full")
+            attach_tooltip(rel_exp, "Define and maintain table-to-table relationships. AI inference here excludes same-table column associations.")
+            with rel_exp:
                 tables = table_names_in_project()
                 if len(tables) <= 1:
                     ui.label("Add at least two tables to define relationships.").classes("text-sm text-slate-500 italic")
@@ -4207,7 +4359,9 @@ async def main_page() -> None:
                                     rm_rel_btn = ui.button(icon="delete").props("flat dense round color=negative size=sm")
                                     rm_rel_btn.on_click(lambda _, i=r_idx: remove_relation_row(i))
 
-            with ui.expansion("3) Visualize", value=True).classes("glass-panel p-2 w-full"):
+            viz_exp = ui.expansion("3) Visualize", value=True).classes("glass-panel p-2 w-full")
+            attach_tooltip(viz_exp, "Preview the current relationship graph for the project based on saved table links.")
+            with viz_exp:
                 rels_for_viz = [
                     r
                     for r in local_state.get("editable_relations", [])
@@ -4324,6 +4478,10 @@ async def main_page() -> None:
     def generate_view() -> None:
         if local_state["page"] != "generate":
             return
+        if local_state["is_loading_project"] and not local_state["project_data"]:
+            with ui.row().classes("w-full justify-center py-24"):
+                ui.spinner(size="lg")
+            return
         if not local_state["project_data"]:
             ui.label("No project loaded.").classes("text-slate-500")
             return
@@ -4386,6 +4544,10 @@ async def main_page() -> None:
     @ui.refreshable
     def output_view() -> None:
         if local_state["page"] != "output":
+            return
+        if local_state["is_loading_project"] and not local_state["project_data"]:
+            with ui.row().classes("w-full justify-center py-24"):
+                ui.spinner(size="lg")
             return
         if not local_state["project_data"]:
             ui.label("No project loaded.").classes("text-slate-500")

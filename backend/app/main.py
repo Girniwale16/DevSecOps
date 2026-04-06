@@ -621,6 +621,7 @@ LARGE_UPLOAD_THRESHOLD_MB = max(1, int(os.getenv("LARGE_UPLOAD_THRESHOLD_MB", "2
 FAST_PROFILE_SAMPLE_ROWS = max(1000, int(os.getenv("FAST_PROFILE_SAMPLE_ROWS", "10000")))
 CSV_PROFILE_SAMPLE_FOR_LARGE_FILES = str(os.getenv("CSV_PROFILE_SAMPLE_FOR_LARGE_FILES", "false")).strip().lower() in {"1", "true", "yes", "on"}
 MAX_CSV_UPLOAD_MB = max(1, int(os.getenv("MAX_CSV_UPLOAD_MB", "50")))
+MAX_DDL_UPLOAD_MB = max(1, int(os.getenv("MAX_DDL_UPLOAD_MB", str(MAX_CSV_UPLOAD_MB))))
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(EXPORT_DIR, exist_ok=True)
 
@@ -762,14 +763,29 @@ async def upload_csv(request: Request, file: UploadFile = File(...)):
 
 @app.post("/upload-ddl")
 async def upload_ddl_api(request: Request, file: UploadFile = File(...), dialect: str = "postgres"):
-    if not file.filename.endswith('.sql'):
+    if not str(file.filename or "").lower().endswith(".sql"):
         raise HTTPException(status_code=400, detail="Only SQL files are allowed")
-    
-    content = (await file.read()).decode("utf-8")
+
+    raw_content = await file.read()
+    file_size_mb = len(raw_content) / (1024 * 1024)
+    if file_size_mb > MAX_DDL_UPLOAD_MB:
+        raise HTTPException(status_code=400, detail=f"DDL file size must be {MAX_DDL_UPLOAD_MB} MB or smaller")
+
+    try:
+        content = raw_content.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        try:
+            content = raw_content.decode("utf-8")
+        except UnicodeDecodeError:
+            raise HTTPException(status_code=400, detail="DDL file must be valid UTF-8 text")
     project_id = str(uuid.uuid4())
-    
+
+    conn = None
     try:
         tables = parse_ddl(content, dialect=dialect)
+        if not tables:
+            raise HTTPException(status_code=400, detail="No CREATE TABLE statements were found in the DDL file")
+
         conn = get_db_connection()
         
         # 1. Create Project
@@ -806,11 +822,19 @@ async def upload_ddl_api(request: Request, file: UploadFile = File(...), dialect
             request,
             "upload_ddl",
             project_id=project_id,
-            details={"filename": file.filename, "dialect": dialect, "table_count": len(tables)},
+            details={"filename": file.filename, "dialect": dialect, "table_count": len(tables), "file_size_mb": round(file_size_mb, 2)},
         )
         return {"project_id": project_id, "tables": tables}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DDL Parsing failed: {str(e)}")
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 @app.post("/upload-schema")
 async def upload_schema(request: Request, payload = Body(...)):
@@ -1228,6 +1252,7 @@ async def assistant_chat(request: Request, payload=Body(...)):
                                 c.allowed_values,
                                 c.allowed_values_expanded,
                                 c.expand_categories,
+                                c.output_format,
                                 p.null_count,
                                 p.min_val,
                                 p.max_val,
