@@ -543,13 +543,27 @@ def _apply_modeling_config_to_df(
             if effective_gen_type == "integer" or "INT" in str(data_type or "").upper():
                 numeric_series = numeric_series.round().astype("Int64")
             out[col_name] = numeric_series
-        if null_pct is not None and str(null_pct).strip():
+        is_nullable = cfg.get("is_nullable")
+        # Default to nullable when metadata is unavailable, but strictly honor explicit non-nullable settings.
+        if isinstance(is_nullable, str):
+            can_inject_nulls = is_nullable.strip().lower() in {"1", "true", "yes", "y"}
+        else:
+            can_inject_nulls = True if is_nullable is None else bool(is_nullable)
+        if can_inject_nulls and null_pct is not None and str(null_pct).strip():
             try:
                 desired_null_fraction = max(0.0, min(100.0, float(null_pct))) / 100.0
                 desired_nulls = int(round(len(out) * desired_null_fraction))
-                if desired_nulls > 0:
-                    null_indices = rng.choice(out.index.to_numpy(), size=min(desired_nulls, len(out)), replace=False)
-                    out.loc[null_indices, col_name] = pd.NA
+                current_nulls = int(out[col_name].isna().sum())
+                additional_nulls = max(0, desired_nulls - current_nulls)
+                if additional_nulls > 0:
+                    candidate_indices = out.index[~out[col_name].isna()].to_numpy()
+                    if len(candidate_indices) > 0:
+                        null_indices = rng.choice(
+                            candidate_indices,
+                            size=min(additional_nulls, len(candidate_indices)),
+                            replace=False,
+                        )
+                        out.loc[null_indices, col_name] = pd.NA
             except Exception:
                 pass
 
@@ -784,6 +798,15 @@ async def upload_ddl_api(request: Request, file: UploadFile = File(...), dialect
     try:
         tables = parse_ddl(content, dialect=dialect)
         if not tables:
+            has_create_table = bool(re.search(r"\bCREATE\s+TABLE\b", content, re.IGNORECASE))
+            logger.warning(
+                "DDL parse returned zero tables filename=%s dialect=%s bytes=%d has_create_table=%s preview=%r",
+                file.filename,
+                dialect,
+                len(raw_content),
+                has_create_table,
+                content[:240],
+            )
             raise HTTPException(status_code=400, detail="No CREATE TABLE statements were found in the DDL file")
 
         conn = get_db_connection()
@@ -2117,6 +2140,7 @@ def run_generation_task(
     num_rows: int,
     seed: int,
     output_format: str,
+    sample_only: bool = False,
     table_settings: Optional[Dict[str, Dict[str, int]]] = None,
     stddev_scale: float = 1.0,
     variation_pct: float = 0.0,
@@ -2130,6 +2154,7 @@ def run_generation_task(
         "logs": [f"Starting generation for project {project_id}..."],
         "file_path": None,
         "project_id": project_id,
+        "sample_only": bool(sample_only),
     }
     try:
         generation_params = {
@@ -2216,7 +2241,8 @@ def run_generation_task(
                 tasks[task_id]["logs"].append(f"Single-table CSV synthesis target: {table_rows} rows.")
                 tasks[task_id]["progress"] = 10
                 ext = ".csv" if output_format == "csv" else ".parquet"
-                output_filename = f"synth_{task_id}{ext}"
+                output_prefix = "sample_" if sample_only else ""
+                output_filename = f"{output_prefix}synth_{task_id}{ext}"
                 output_path = os.path.join(EXPORT_DIR, output_filename)
                 
                 tasks[task_id]["logs"].append("Fitting model and sampling data (GaussianCopula)...")
@@ -2324,7 +2350,8 @@ def run_generation_task(
                 tasks[task_id]["progress"] = 80
 
                 tasks[task_id]["logs"].append("Packaging results into archive...")
-                output_filename = f"multi_synth_{task_id}.zip"
+                output_prefix = "sample_" if sample_only else ""
+                output_filename = f"{output_prefix}multi_synth_{task_id}.zip"
                 output_path = os.path.join(EXPORT_DIR, output_filename)
                 with zipfile.ZipFile(output_path, "w") as z:
                     for t_name, df in synth_dict.items():
@@ -2345,8 +2372,20 @@ def run_generation_task(
             tasks[task_id]["logs"].append(f"Schema-based mock generation starting for {num_rows} rows...")
             conn = get_db_connection()
             tables_data = conn.execute("""
-                SELECT t.name as table_name, c.name as column_name, c.data_type, c.is_pk as is_primary_key, c.generator_type, c.is_nullable, c.allowed_values, c.allowed_values_expanded
-                FROM tables t JOIN columns c ON t.id = c.table_id WHERE t.project_id = ?
+                SELECT
+                    t.name as table_name,
+                    c.name as column_name,
+                    c.data_type,
+                    c.is_pk as is_primary_key,
+                    c.generator_type,
+                    c.is_nullable,
+                    c.allowed_values,
+                    c.allowed_values_expanded,
+                    p.null_value_percent
+                FROM tables t
+                JOIN columns c ON t.id = c.table_id
+                LEFT JOIN column_profiles p ON p.column_id = c.id
+                WHERE t.project_id = ?
             """, (project_id,)).df().to_dict('records')
             
             tables_metadata = conn.execute("SELECT * FROM tables WHERE project_id = ?", (project_id,)).df().to_dict('records')
@@ -2376,7 +2415,8 @@ def run_generation_task(
             tasks[task_id]["progress"] = 90
 
             tasks[task_id]["logs"].append(f"Exporting {len(table_names)} tables from Sandbox to Archive...")
-            output_filename = f"mock_{task_id}.zip"
+            output_prefix = "sample_" if sample_only else ""
+            output_filename = f"{output_prefix}mock_{task_id}.zip"
             output_path = os.path.join(EXPORT_DIR, output_filename)
             
             with zipfile.ZipFile(output_path, "w") as z:
@@ -2440,6 +2480,7 @@ async def generate_dispatch(
     num_rows: float = 100,
     seed: int = 42,
     format: str = "csv",
+    sample_only: bool = False,
     table_settings_json: str = "",
     stddev_scale: float = 1.0,
     variation_pct: float = 0.0,
@@ -2461,6 +2502,7 @@ async def generate_dispatch(
             "num_rows": rows_int,
             "seed": seed,
             "format": format,
+            "sample_only": bool(sample_only),
             "table_setting_count": len(table_settings) if isinstance(table_settings, dict) else 0,
         },
     )
@@ -2471,6 +2513,7 @@ async def generate_dispatch(
         rows_int,
         seed,
         format,
+        bool(sample_only),
         table_settings,
         float(stddev_scale),
         float(variation_pct),

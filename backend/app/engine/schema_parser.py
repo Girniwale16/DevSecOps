@@ -5,7 +5,7 @@ import re
 
 
 _COLUMN_TYPE_PATTERN = re.compile(
-    r"(^|,)\s*(?!constraint\b|primary\b|foreign\b|unique\b|check\b)([^\"\(\)\n][^,\n]*?)(\s+"
+    r"([,(])\s*(?!constraint\b|primary\b|foreign\b|unique\b|check\b)([^\"\(\)\n][^,\n]*?)(\s+"
     r"(?:character varying|varchar|char|text|numeric|decimal|double precision|double|float|real|bigint|integer|int|smallint|boolean|bool|date|timestamp|datetime)\b)",
     re.IGNORECASE,
 )
@@ -17,8 +17,6 @@ def _cleanup_ddl(sql_text: str) -> str:
     text = re.sub(r"\bCOLLATE\s+\w+\b", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\bDISTKEY\b", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\bSORTKEY\b", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"\s+", " ", text)
-    text = text.replace(" ,", ",").replace("( ", "(").replace(" )", ")")
     return text
 
 
@@ -32,8 +30,7 @@ def _quote_problematic_column_names(sql_text: str) -> str:
         if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", raw_name):
             return match.group(0)
         escaped = raw_name.replace('"', '""')
-        spacer = "" if separator == "," else separator
-        return f'{spacer}"{escaped}"{type_part}'
+        return f'{separator}"{escaped}"{type_part}'
 
     return re.sub(_COLUMN_TYPE_PATTERN, _replace, sql_text, flags=0)
 

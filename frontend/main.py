@@ -923,7 +923,30 @@ async def main_page() -> None:
         text = str(value or "").strip().lower()
         if not text:
             return "varchar"
-        return TYPE_NORMALIZATION.get(text, text)
+        text = re.sub(r"\s+", " ", text)
+        base = re.sub(r"\s*\([^)]*\)", "", text).strip()
+
+        # Normalize common SQL variants before option lookup.
+        base = re.sub(r"\s+without\s+time\s+zone$", "", base)
+        base = re.sub(r"\s+with\s+time\s+zone$", "", base)
+
+        if base.startswith("character varying"):
+            base = "character varying"
+        elif base.startswith("varchar"):
+            base = "varchar"
+        elif base.startswith("char"):
+            base = "char"
+        elif base.startswith("decimal"):
+            base = "decimal"
+        elif base.startswith("numeric"):
+            base = "numeric"
+        elif base.startswith("double precision"):
+            base = "double precision"
+        elif base.startswith("timestamp"):
+            base = "timestamp"
+
+        normalized = TYPE_NORMALIZATION.get(base, base)
+        return normalized if normalized in SCHEMA_TYPE_OPTIONS else "varchar"
 
     def project_table_count() -> int:
         return len((local_state.get("project_data") or {}).get("tables") or [])
@@ -3173,6 +3196,7 @@ async def main_page() -> None:
                 "num_rows": effective_rows,
                 "seed": int(local_state["seed"]),
                 "format": local_state["output_format"],
+                "sample_only": bool(sample_only),
                 "table_settings_json": json.dumps(table_settings_payload),
                 "stddev_scale": float(max(0.0, local_state["stddev_scale"])),
                 "variation_pct": float(max(0.0, local_state["variation_pct"])),
@@ -3427,6 +3451,10 @@ async def main_page() -> None:
             row["cardinality"] = "1:N"
         return row
 
+    def _is_complete_relation_row(row: Dict[str, Any]) -> bool:
+        norm = _normalize_relation_row(row)
+        return bool(norm["from_table"] and norm["from_column"] and norm["to_table"] and norm["to_column"])
+
     def _infer_generator_from_dtype(data_type: str) -> str:
         dtype = str(data_type or "").upper()
         if any(t in dtype for t in ["DATE", "TIME"]):
@@ -3526,8 +3554,14 @@ async def main_page() -> None:
         if not local_state["project_data"]:
             local_state["editable_relations"] = []
             return
+        # Preserve in-progress local drafts so async project reloads do not wipe user edits.
+        local_drafts = [
+            _normalize_relation_row(r)
+            for r in (local_state.get("editable_relations") or [])
+            if not _is_complete_relation_row(r)
+        ]
         rels = local_state["project_data"].get("relations", [])
-        local_state["editable_relations"] = [_normalize_relation_row(r) for r in rels]
+        local_state["editable_relations"] = [_normalize_relation_row(r) for r in rels] + local_drafts
         for row in local_state["editable_relations"]:
             _ensure_relation_columns(row)
 
@@ -3546,7 +3580,6 @@ async def main_page() -> None:
         }
         local_state["editable_relations"].insert(0, row)
         safe_refresh(modeling_view)
-        queue_relationship_autosave()
 
     def remove_relation_row(index: int) -> None:
         if 0 <= index < len(local_state["editable_relations"]):
@@ -3560,7 +3593,6 @@ async def main_page() -> None:
             row["from_column"] = ""
             row["to_column"] = ""
             safe_refresh(modeling_view)
-            queue_relationship_autosave()
 
     async def infer_relationships_with_ai() -> None:
         if not local_state["project_id"]:
@@ -3614,7 +3646,11 @@ async def main_page() -> None:
             updated = int(data.get("updated_count", 0))
             if notify:
                 safe_notify(f"Saved {updated} relationship(s).", notify_type="positive")
-            await load_project(refresh_plan=False, refresh_summary=False)
+                await load_project(refresh_plan=False, refresh_summary=False)
+            else:
+                # Keep local draft rows stable during autosave; avoid full project reload on every field change.
+                if local_state.get("project_data") is not None:
+                    local_state["project_data"]["relations"] = [dict(r) for r in payload_rows]
         except Exception as ex:
             if notify:
                 safe_notify(f"Save relationships failed: {ex}", notify_type="negative")

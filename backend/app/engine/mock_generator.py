@@ -330,10 +330,17 @@ def generate_mock_from_schema(
                     if not base_sql:
                         base_sql = "'val_' || CAST(row_random(i) * 1000 AS INT)"
             
-            # Apply NULLs if column is nullable and not a Primary Key
-            if is_nullable and not is_pk and not fk_rel:
-                # 10% chance of NULL
-                sql_cols.append(f"CASE WHEN row_random(i) < 0.10 THEN NULL ELSE {base_sql} END")
+            # Apply NULLs only when explicitly configured via null_value_percent.
+            null_pct_raw = col.get("null_value_percent")
+            null_fraction = 0.0
+            try:
+                if null_pct_raw is not None and str(null_pct_raw).strip() != "":
+                    null_fraction = max(0.0, min(100.0, float(null_pct_raw))) / 100.0
+            except Exception:
+                null_fraction = 0.0
+
+            if is_nullable and not is_pk and not fk_rel and null_fraction > 0:
+                sql_cols.append(f"CASE WHEN row_random(i) < {null_fraction:.6f} THEN NULL ELSE {base_sql} END")
             else:
                 sql_cols.append(base_sql)
 
