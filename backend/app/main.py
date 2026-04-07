@@ -1046,76 +1046,99 @@ async def get_table_correlations(project_id: str, table_id: str, request: Reques
         if not table_rows:
             raise HTTPException(status_code=404, detail="Table not found")
 
+        metadata_columns = safe_df_to_dict(
+            conn.execute(
+                """
+                SELECT c.name, c.data_type, p.cardinality
+                FROM columns c
+                LEFT JOIN column_profiles p ON c.id = p.column_id
+                WHERE c.table_id = ?
+                ORDER BY c.name
+                """,
+                (table_id,),
+            ).df()
+        )
+
         file_path = table_rows[0].get("file_path")
-        if not file_path or not os.path.exists(file_path):
-            return {"table_id": table_id, "correlations": [], "note": "No source data available."}
-
-        try:
-            df = pd.read_csv(file_path)
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail=f"Unable to read source data: {exc}")
-
-        if df.empty:
-            return {"table_id": table_id, "correlations": [], "note": "No rows available for correlation."}
-
-        numeric_df = df.select_dtypes(include=["number"])
-        if numeric_df.shape[1] < 2:
-            corr_rows = []
-            corr_note = "Need at least two numeric columns."
-        else:
-            corr = numeric_df.corr().fillna(0.0)
-            corr_rows = []
-            cols = list(corr.columns)
-            for i in range(len(cols)):
-                for j in range(i + 1, len(cols)):
-                    corr_rows.append({"col_a": cols[i], "col_b": cols[j], "corr": float(corr.iloc[i, j])})
-            corr_rows.sort(key=lambda r: abs(r["corr"]), reverse=True)
-            if top_k is not None and int(top_k) > 0:
-                corr_rows = corr_rows[: int(top_k)]
-            corr_note = None
-
+        df = None
+        corr_rows = []
+        corr_note = None
         assoc_rows = []
         assoc_note = None
-        cat_df = df.select_dtypes(exclude=["number"]).copy()
-        if cat_df.shape[1] >= 2:
-            max_unique = 50
-            for col in list(cat_df.columns):
-                uniques = cat_df[col].dropna().unique()
-                if len(uniques) > max_unique:
-                    cat_df = cat_df.drop(columns=[col])
-            cat_cols = list(cat_df.columns)
-            if len(cat_cols) < 2:
-                assoc_note = "Categorical columns have too many unique values."
-            else:
-                for i in range(len(cat_cols)):
-                    for j in range(i + 1, len(cat_cols)):
-                        c1 = cat_cols[i]
-                        c2 = cat_cols[j]
-                        if cat_df[c1].dropna().nunique() < 2 or cat_df[c2].dropna().nunique() < 2:
-                            continue
-                        ct = pd.crosstab(cat_df[c1], cat_df[c2])
-                        if ct.size == 0:
-                            continue
-                        obs = ct.to_numpy()
-                        n = obs.sum()
-                        if n == 0:
-                            continue
-                        row_sums = obs.sum(axis=1, keepdims=True)
-                        col_sums = obs.sum(axis=0, keepdims=True)
-                        expected = row_sums @ col_sums / n
-                        with np.errstate(divide="ignore", invalid="ignore"):
-                            chi2 = np.nansum((obs - expected) ** 2 / expected)
-                        r, k = obs.shape
-                        denom = n * (min(r - 1, k - 1))
-                        if denom <= 0:
-                            continue
-                        cramers_v = float(np.sqrt(chi2 / denom))
-                        assoc_rows.append({"col_a": c1, "col_b": c2, "score": cramers_v, "metric": "Cramer's V"})
-                assoc_rows.sort(key=lambda r: r["score"], reverse=True)
-                if top_k is not None and int(top_k) > 0:
-                    assoc_rows = assoc_rows[: int(top_k)]
+        source_data_note = None
+
+        if file_path and os.path.exists(file_path):
+            try:
+                df = pd.read_csv(file_path)
+            except Exception as exc:
+                source_data_note = f"Unable to read source data: {exc}"
         else:
-            assoc_note = "Need at least two categorical columns."
+            source_data_note = "No source data available."
+
+        if df is not None:
+            if df.empty:
+                corr_note = "No rows available for correlation."
+                assoc_note = "No rows available for associations."
+            else:
+                numeric_df = df.select_dtypes(include=["number"])
+                if numeric_df.shape[1] < 2:
+                    corr_note = "Need at least two numeric columns."
+                else:
+                    corr = numeric_df.corr().fillna(0.0)
+                    cols = list(corr.columns)
+                    for i in range(len(cols)):
+                        for j in range(i + 1, len(cols)):
+                            corr_rows.append({"col_a": cols[i], "col_b": cols[j], "corr": float(corr.iloc[i, j])})
+                    corr_rows.sort(key=lambda r: abs(r["corr"]), reverse=True)
+                    if top_k is not None and int(top_k) > 0:
+                        corr_rows = corr_rows[: int(top_k)]
+
+                cat_df = df.select_dtypes(exclude=["number"]).copy()
+                if cat_df.shape[1] >= 2:
+                    max_unique = 50
+                    for col in list(cat_df.columns):
+                        uniques = cat_df[col].dropna().unique()
+                        if len(uniques) > max_unique:
+                            cat_df = cat_df.drop(columns=[col])
+                    cat_cols = list(cat_df.columns)
+                    if len(cat_cols) < 2:
+                        assoc_note = "Categorical columns have too many unique values."
+                    else:
+                        for i in range(len(cat_cols)):
+                            for j in range(i + 1, len(cat_cols)):
+                                c1 = cat_cols[i]
+                                c2 = cat_cols[j]
+                                if cat_df[c1].dropna().nunique() < 2 or cat_df[c2].dropna().nunique() < 2:
+                                    continue
+                                ct = pd.crosstab(cat_df[c1], cat_df[c2])
+                                if ct.size == 0:
+                                    continue
+                                obs = ct.to_numpy()
+                                n = obs.sum()
+                                if n == 0:
+                                    continue
+                                row_sums = obs.sum(axis=1, keepdims=True)
+                                col_sums = obs.sum(axis=0, keepdims=True)
+                                expected = row_sums @ col_sums / n
+                                with np.errstate(divide="ignore", invalid="ignore"):
+                                    chi2 = np.nansum((obs - expected) ** 2 / expected)
+                                r, k = obs.shape
+                                denom = n * (min(r - 1, k - 1))
+                                if denom <= 0:
+                                    continue
+                                cramers_v = float(np.sqrt(chi2 / denom))
+                                assoc_rows.append({"col_a": c1, "col_b": c2, "score": cramers_v, "metric": "Cramer's V"})
+                        assoc_rows.sort(key=lambda r: r["score"], reverse=True)
+                        if top_k is not None and int(top_k) > 0:
+                            assoc_rows = assoc_rows[: int(top_k)]
+                else:
+                    assoc_note = "Need at least two categorical columns."
+
+        if source_data_note:
+            if not corr_note:
+                corr_note = source_data_note
+            if not assoc_note:
+                assoc_note = source_data_note
 
         llm_rows = []
         llm_note = None
@@ -1123,27 +1146,38 @@ async def get_table_correlations(project_id: str, table_id: str, request: Reques
         llm_model = None
         llm_usage = None
         try:
-            sample_df = df.head(500)
             columns_payload = []
-            for col_name in sample_df.columns:
-                series = sample_df[col_name]
-                data_type = str(series.dtype)
-                cardinality = int(series.nunique(dropna=True))
-                sample_values = (
-                    series.dropna()
-                    .astype(str)
-                    .value_counts()
-                    .head(6)
-                    .index.tolist()
-                )
-                columns_payload.append(
-                    {
-                        "column_name": col_name,
-                        "data_type": data_type,
-                        "cardinality": cardinality,
-                        "sample_values": sample_values,
-                    }
-                )
+            if df is not None and not df.empty:
+                sample_df = df.head(500)
+                for col_name in sample_df.columns:
+                    series = sample_df[col_name]
+                    data_type = str(series.dtype)
+                    cardinality = int(series.nunique(dropna=True))
+                    sample_values = (
+                        series.dropna()
+                        .astype(str)
+                        .value_counts()
+                        .head(6)
+                        .index.tolist()
+                    )
+                    columns_payload.append(
+                        {
+                            "column_name": col_name,
+                            "data_type": data_type,
+                            "cardinality": cardinality,
+                            "sample_values": sample_values,
+                        }
+                    )
+            else:
+                for col in metadata_columns:
+                    columns_payload.append(
+                        {
+                            "column_name": str(col.get("name") or ""),
+                            "data_type": str(col.get("data_type") or ""),
+                            "cardinality": int(col.get("cardinality") or 0),
+                            "sample_values": [],
+                        }
+                    )
             llm_resp = await infer_column_associations(table_rows[0].get("name", ""), columns_payload)
             llm_rows = llm_resp.get("associations", [])
             llm_source = llm_resp.get("source")

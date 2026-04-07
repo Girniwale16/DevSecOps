@@ -1080,10 +1080,10 @@ async def main_page() -> None:
 
         page = assistant_current_page()
         selected_mode = str(local_state.get("setup_mode") or "").strip().lower()
-        mode_titles = {"csv": "CSV Ingestion", "ddl": "DDL Blueprint", "schema": "Schema Studio"}
+        mode_titles = {"csv": "CSV Ingestion", "schema": "Schema Studio"}
         current_mode = mode_titles.get(selected_mode)
         if page == "upload":
-            text = "Hello, how may I help you? We can get started with CSV Ingestion, DDL Blueprint, or Schema Studio."
+            text = "Hello, how may I help you? We can get started with CSV Ingestion or Schema Studio."
             if current_mode and not local_state.get("assistant_fresh_start"):
                 text = f"Hello, how may I help you? You are on {assistant_page_title()} and {current_mode} is ready to continue."
             return [
@@ -1304,16 +1304,6 @@ async def main_page() -> None:
                 "source": "local",
                 "model": None,
             }
-        if page == "upload" and "ddl" in lowered and any(token in lowered for token in ["upload", "use", "select", "choose"]):
-            select_setup_mode("ddl")
-            assistant_set_page("input")
-            return {
-                "reply": "I opened DDL Blueprint. Please upload your SQL DDL file below.",
-                "action": {},
-                "source": "local",
-                "model": None,
-            }
-
         requested_columns_match = re.search(r"(\d+)\s+columns?", lowered)
         asks_for_schema_start = any(
             token in lowered
@@ -1327,10 +1317,6 @@ async def main_page() -> None:
             "use csv",
             "select csv",
             "choose csv",
-            "upload ddl",
-            "use ddl",
-            "select ddl",
-            "choose ddl",
             "use schema",
             "select schema",
             "choose schema",
@@ -1615,20 +1601,11 @@ async def main_page() -> None:
                     "action": {"setup_mode": "schema", "target_page": "input"},
                 }
             )
-            actions.append(
-                {
-                    "label": "DDL Blueprint (Selected)" if selected_mode == "ddl" and not fresh_start else "DDL Blueprint",
-                    "action": {"setup_mode": "ddl", "target_page": "input"},
-                }
-            )
         elif page == "input":
             actions.append({"label": "Go Back", "action": {"target_page": "upload"}})
             if selected_mode == "csv":
                 if bool(local_state.get("project_id")) and local_state.get("multi_csv_inflight", 0) == 0:
                     actions.append({"label": "Upload Another File", "action": {}})
-                    actions.append({"label": "Continue", "action": {"target_page": "project"}})
-            elif selected_mode == "ddl":
-                if bool(local_state.get("project_id")):
                     actions.append({"label": "Continue", "action": {"target_page": "project"}})
             elif selected_mode == "schema":
                 if bool(local_state.get("project_id")):
@@ -1717,8 +1694,6 @@ async def main_page() -> None:
             return "CSV selected. Upload your file below to create the workspace."
         if target_page == "input" and setup_mode == "schema":
             return "Schema Studio selected. Define tables and columns below, then create the workspace."
-        if target_page == "input" and setup_mode == "ddl":
-            return "DDL Blueprint selected. Upload your SQL DDL file below to create the workspace."
         if not target_page and not operation and setup_mode == "csv":
             return "CSV mode is ready. Upload your next file below whenever you are ready."
         if target_page == "project":
@@ -1746,11 +1721,7 @@ async def main_page() -> None:
                 normalized["setup_mode"] = "schema"
                 normalized["target_page"] = "input"
                 return normalized
-            if "ddl" in lowered and any(token in lowered for token in ["upload", "use", "select", "choose"]):
-                normalized["setup_mode"] = "ddl"
-                normalized["target_page"] = "input"
-                return normalized
-            if setup_mode in {"csv", "schema", "ddl"} and not target_page:
+            if setup_mode in {"csv", "schema"} and not target_page:
                 normalized["target_page"] = "input"
             elif not setup_mode and not target_page:
                 if "csv" in lowered and any(token in lowered for token in ["upload", "use", "select", "choose"]):
@@ -1758,9 +1729,6 @@ async def main_page() -> None:
                     normalized["target_page"] = "input"
                 elif "schema" in lowered and any(token in lowered for token in ["use", "select", "choose", "create"]):
                     normalized["setup_mode"] = "schema"
-                    normalized["target_page"] = "input"
-                elif "ddl" in lowered and any(token in lowered for token in ["upload", "use", "select", "choose"]):
-                    normalized["setup_mode"] = "ddl"
                     normalized["target_page"] = "input"
             if str(local_state.get("setup_mode") or "") == "csv" and any(token in lowered for token in ["where should i upload", "where do i upload", "where can i upload", "how do i upload", "upload where"]):
                 normalized["target_page"] = "input"
@@ -1772,7 +1740,7 @@ async def main_page() -> None:
         target_page = str(action.get("target_page") or "").strip().lower()
         operation = str(action.get("operation") or "").strip().lower()
 
-        if setup_mode in {"csv", "schema", "ddl"}:
+        if setup_mode in {"csv", "schema"}:
             select_setup_mode(setup_mode)
         if target_page in {"upload", "input", "project", "modeling", "generate", "output"}:
             if local_state.get("assistant_mode_active"):
@@ -3382,9 +3350,6 @@ async def main_page() -> None:
                                         ).bind_value(col, "output_format").classes(width_class)
                                         output_format_input.on("update:model-value", lambda _, c=col: queue_modeling_autosave())
                                         attach_tooltip(output_format_input, _datetime_output_format_tooltip(col))
-                                        ui.label(
-                                            f"Example: {_datetime_output_format_placeholder(col)}"
-                                        ).classes("text-[11px] text-slate-400")
 
                             with ui.row().classes("w-full items-center gap-2 mt-1 flex-wrap"):
                                 null_input = ui.number("Null %", format="%.2f").bind_value(col, "null_value_percent").classes(stat_class)
@@ -4166,9 +4131,9 @@ async def main_page() -> None:
                                     ui.aggrid(
                                         {
                                             "columnDefs": [
-                                                {"headerName": "Column A", "field": "col_a", "minWidth": 160},
-                                                {"headerName": "Column B", "field": "col_b", "minWidth": 160},
-                                                {"headerName": "Correlation", "field": "corr", "width": 140, "valueFormatter": _corr_fmt},
+                                                {"headerName": "Column A", "field": "col_a", "minWidth": 160, "headerTooltip": "First numeric column in the pair being compared."},
+                                                {"headerName": "Column B", "field": "col_b", "minWidth": 160, "headerTooltip": "Second numeric column in the pair being compared."},
+                                                {"headerName": "Correlation", "field": "corr", "width": 140, "valueFormatter": _corr_fmt, "headerTooltip": "Linear correlation score between the two numeric columns."},
                                             ],
                                             "rowData": local_state["correlation_rows"],
                                             "defaultColDef": {"resizable": True},
@@ -4193,10 +4158,10 @@ async def main_page() -> None:
                                     ui.aggrid(
                                         {
                                             "columnDefs": [
-                                                {"headerName": "Column A", "field": "col_a", "minWidth": 160},
-                                                {"headerName": "Column B", "field": "col_b", "minWidth": 160},
-                                                {"headerName": "Association", "field": "score", "width": 140, "valueFormatter": _assoc_fmt},
-                                                {"headerName": "Metric", "field": "metric", "width": 120},
+                                                {"headerName": "Column A", "field": "col_a", "minWidth": 160, "headerTooltip": "First categorical column in the pair being compared."},
+                                                {"headerName": "Column B", "field": "col_b", "minWidth": 160, "headerTooltip": "Second categorical column in the pair being compared."},
+                                                {"headerName": "Association", "field": "score", "width": 140, "valueFormatter": _assoc_fmt, "headerTooltip": "Association strength score between the two categorical columns."},
+                                                {"headerName": "Metric", "field": "metric", "width": 120, "headerTooltip": "Statistical metric used to compute the association score."},
                                             ],
                                             "rowData": local_state["association_rows"],
                                             "defaultColDef": {"resizable": True},
