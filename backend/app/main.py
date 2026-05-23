@@ -33,6 +33,8 @@ from app.engine.llm_usage import sum_usage
 from app.auth import current_user_from_request, init_auth_storage, is_public_path, log_request_activity, router as auth_router
 import pandas as pd
 import numpy as np
+from app.engine import timeseries_analyzer
+from app.engine import timeseries_generator
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -2180,6 +2182,10 @@ def run_generation_task(
     variation_pct: float = 0.0,
     knn_smoothing: float = 0.0,
     knn_neighbors: int = 5,
+    timeseries_mode: bool = False,
+    ts_start_date: Optional[str] = None,
+    ts_frequency: Optional[str] = None,
+    ts_seasonal_scale: float = 1.0,
 ):
     start_time = time.time()
     tasks[task_id] = {
@@ -2278,7 +2284,51 @@ def run_generation_task(
                 output_prefix = "sample_" if sample_only else ""
                 output_filename = f"{output_prefix}synth_{task_id}{ext}"
                 output_path = os.path.join(EXPORT_DIR, output_filename)
-                
+
+                # ---- TIME-SERIES MODE ----
+                if timeseries_mode:
+                    tasks[task_id]["logs"].append("Time Series mode: loading pattern model from project...")
+                    tasks[task_id]["progress"] = 15
+                    conn_ts = get_db_connection()
+                    project_row = conn_ts.execute(
+                        "SELECT timeseries_model, ts_time_column, ts_frequency FROM projects WHERE id = ?",
+                        (project_id,)
+                    ).df().to_dict("records")
+                    conn_ts.close()
+                    if not project_row or not project_row[0].get("timeseries_model"):
+                        raise ValueError(
+                            "Time Series mode requested but no pattern model found. "
+                            "Please run 'Analyse Time Series' first."
+                        )
+                    pattern_model = json.loads(project_row[0]["timeseries_model"])
+                    freq_override = ts_frequency or project_row[0].get("ts_frequency") or None
+                    tasks[task_id]["logs"].append(
+                        f"Generating {table_rows} rows via Time Series synthesis "
+                        f"(freq={freq_override or pattern_model.get('inferred_frequency', 'D')}, "
+                        f"seasonal_scale={ts_seasonal_scale:.2f}, start={ts_start_date or 'auto'})..."
+                    )
+                    tasks[task_id]["progress"] = 30
+                    synth_df = timeseries_generator.generate(
+                        pattern_model=pattern_model,
+                        n_rows=table_rows,
+                        start_date=ts_start_date or None,
+                        frequency=freq_override,
+                        seed=table_seed,
+                        seasonal_scale=ts_seasonal_scale,
+                    )
+                    tasks[task_id]["progress"] = 80
+                    if output_format == "parquet":
+                        synth_df.to_parquet(output_path, index=False)
+                    else:
+                        synth_df.to_csv(output_path, index=False)
+                    tasks[task_id]["file_path"] = output_path
+                    tasks[task_id]["progress"] = 100
+                    tasks[task_id]["status"] = "done"
+                    duration = round(time.time() - start_time, 2)
+                    tasks[task_id]["logs"].append(f"Time Series generation successful in {duration}s. Output: {output_filename}")
+                    return
+                # ---- END TIME-SERIES MODE ----
+
                 tasks[task_id]["logs"].append("Fitting model and sampling data (GaussianCopula)...")
                 tasks[task_id]["progress"] = 15
                 temp_csv = os.path.join(EXPORT_DIR, f"temp_{task_id}.csv")
@@ -2506,6 +2556,128 @@ def run_generation_task(
         import traceback
         traceback.print_exc()
 
+@app.post("/project/{project_id}/timeseries-analyze")
+async def timeseries_analyze(
+    project_id: str,
+    request: Request,
+    time_column: str = "",
+    table_name: str = "",
+    apply: bool = True,
+):
+    """
+    Analyse a CSV project for time-series patterns.
+    For multi-table projects, uses the first table (or the one matching `table_name`).
+    Stores the resulting pattern model in the projects table.
+    Returns the full pattern model + a human-readable summary.
+    """
+    conn = get_db_connection()
+    try:
+        project_rows = safe_df_to_dict(conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).df())
+        if not project_rows:
+            raise HTTPException(status_code=404, detail="Project not found")
+        tables = safe_df_to_dict(conn.execute("SELECT * FROM tables WHERE project_id = ?", (project_id,)).df())
+        if not tables:
+            raise HTTPException(status_code=400, detail="Project has no tables.")
+
+        # Pick the right table — prefer the named one, otherwise the first with a valid CSV
+        selected_table = None
+        target_name = str(table_name or "").strip().lower()
+        for t in tables:
+            fp = str(t.get("file_path") or "")
+            if not fp or not os.path.exists(fp):
+                continue
+            if target_name and str(t.get("name") or "").strip().lower() != target_name:
+                continue
+            selected_table = t
+            break
+
+        if selected_table is None:
+            raise HTTPException(
+                status_code=400,
+                detail="No table with a valid source CSV found. Upload a CSV table first.",
+            )
+
+        table = selected_table
+        file_path = str(table.get("file_path") or "")
+
+        # Auto-detect time column if not provided
+        actual_time_column = str(time_column or "").strip()
+        if not actual_time_column:
+            candidates = timeseries_analyzer.detect_time_columns(file_path)
+            if not candidates:
+                raise HTTPException(status_code=400, detail="No datetime column detected. Please specify one.")
+            actual_time_column = candidates[0]
+
+        try:
+            pattern_model = timeseries_analyzer.analyze(file_path, actual_time_column)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        summary_text = timeseries_analyzer.model_summary_text(pattern_model)
+        pattern_model_json = json.dumps(pattern_model)
+        freq = pattern_model.get("inferred_frequency", "D")
+
+        if apply:
+            conn.execute(
+                """
+                UPDATE projects
+                SET is_timeseries = TRUE,
+                    timeseries_model = ?,
+                    ts_time_column = ?,
+                    ts_frequency = ?
+                WHERE id = CAST(? AS UUID)
+                """,
+                (pattern_model_json, actual_time_column, freq, project_id),
+            )
+
+        log_request_activity(
+            request,
+            "timeseries_analyze",
+            project_id=project_id,
+            details={"time_column": actual_time_column, "freq": freq, "applied": apply},
+        )
+        return {
+            "project_id": project_id,
+            "time_column": actual_time_column,
+            "applied": apply,
+            "summary": summary_text,
+            "pattern_model": pattern_model,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Time series analysis failed: {exc}") from exc
+    finally:
+        conn.close()
+
+
+@app.get("/project/{project_id}/timeseries-model")
+async def get_timeseries_model(project_id: str):
+    """Return the stored time-series pattern model for a project (if any)."""
+    conn = get_db_connection()
+    try:
+        rows = safe_df_to_dict(conn.execute(
+            "SELECT is_timeseries, timeseries_model, ts_time_column, ts_frequency FROM projects WHERE id = ?",
+            (project_id,)
+        ).df())
+        if not rows:
+            raise HTTPException(status_code=404, detail="Project not found")
+        row = rows[0]
+        if not row.get("timeseries_model"):
+            return {"project_id": project_id, "is_timeseries": False, "pattern_model": None}
+        model = json.loads(row["timeseries_model"])
+        return {
+            "project_id": project_id,
+            "is_timeseries": bool(row.get("is_timeseries")),
+            "time_column": row.get("ts_time_column"),
+            "frequency": row.get("ts_frequency"),
+            "summary": timeseries_analyzer.model_summary_text(model),
+            "pattern_model": model,
+        }
+    finally:
+        conn.close()
+
+
 @app.get("/generate/{project_id}")
 async def generate_dispatch(
     project_id: str,
@@ -2520,6 +2692,10 @@ async def generate_dispatch(
     variation_pct: float = 0.0,
     knn_smoothing: float = 0.0,
     knn_neighbors: int = 5,
+    timeseries_mode: bool = False,
+    ts_start_date: str = "",
+    ts_frequency: str = "",
+    ts_seasonal_scale: float = 1.0,
 ):
     task_id = str(uuid.uuid4())
     # Cast num_rows to int in case it came as a float string from JS
@@ -2537,6 +2713,7 @@ async def generate_dispatch(
             "seed": seed,
             "format": format,
             "sample_only": bool(sample_only),
+            "timeseries_mode": bool(timeseries_mode),
             "table_setting_count": len(table_settings) if isinstance(table_settings, dict) else 0,
         },
     )
@@ -2553,6 +2730,10 @@ async def generate_dispatch(
         float(variation_pct),
         float(knn_smoothing),
         int(knn_neighbors),
+        bool(timeseries_mode),
+        str(ts_start_date or "").strip() or None,
+        str(ts_frequency or "").strip() or None,
+        float(ts_seasonal_scale),
     )
     return {"task_id": task_id}
 

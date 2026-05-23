@@ -437,6 +437,15 @@ async def main_page() -> None:
         "admin_create_role": "user",
         "admin_create_active": True,
         "profile_menu_open": False,
+        # Time Series
+        "ts_mode_enabled": False,
+        "ts_time_column": "",
+        "ts_start_date": "",
+        "ts_frequency": "",
+        "ts_seasonal_scale": 1.0,
+        "ts_is_analyzing": False,
+        "ts_analysis_summary": "",
+        "ts_pattern_model": None,
     }
     SCHEMA_TYPE_OPTIONS = [
         "varchar",
@@ -1967,6 +1976,15 @@ async def main_page() -> None:
         local_state["sample_preview_tables"] = []
         local_state["sample_preview_error"] = None
         local_state["editable_relations"] = []
+        # Reset time series state
+        local_state["ts_mode_enabled"] = False
+        local_state["ts_time_column"] = ""
+        local_state["ts_start_date"] = ""
+        local_state["ts_frequency"] = ""
+        local_state["ts_seasonal_scale"] = 1.0
+        local_state["ts_is_analyzing"] = False
+        local_state["ts_analysis_summary"] = ""
+        local_state["ts_pattern_model"] = None
         if clear_uploaded:
             local_state["uploaded_tables"] = []
 
@@ -3160,6 +3178,8 @@ async def main_page() -> None:
             else:
                 table_settings_payload = raw_table_settings
 
+            # Time series parameters
+            ts_mode = bool(local_state.get("ts_mode_enabled")) and bool(local_state.get("ts_pattern_model"))
             params = {
                 "num_rows": effective_rows,
                 "seed": int(local_state["seed"]),
@@ -3170,6 +3190,10 @@ async def main_page() -> None:
                 "variation_pct": float(max(0.0, local_state["variation_pct"])),
                 "knn_smoothing": float(min(1.0, max(0.0, local_state["knn_smoothing"]))),
                 "knn_neighbors": int(max(1, local_state["knn_neighbors"])),
+                "timeseries_mode": ts_mode,
+                "ts_start_date": str(local_state.get("ts_start_date") or "").strip(),
+                "ts_frequency": str(local_state.get("ts_frequency") or "").strip(),
+                "ts_seasonal_scale": float(local_state.get("ts_seasonal_scale") or 1.0),
             }
             async with api_client(timeout=60.0) as client:
                 resp = await client.get(f"{BACKEND_URL}/generate/{local_state['project_id']}", params=params)
@@ -3181,6 +3205,43 @@ async def main_page() -> None:
             local_state["task_logs"].append(f"Generation start failed: {ex}")
             local_state["task_logs"].append("Ensure backend service is running on port 8000.")
             refresh_all()
+
+    async def analyze_timeseries() -> None:
+        """Call the backend timeseries-analyze endpoint and store the pattern model."""
+        if not local_state.get("project_id"):
+            safe_notify("No project loaded.", notify_type="warning")
+            return
+        if local_state.get("ts_is_analyzing"):
+            return
+        time_col = str(local_state.get("ts_time_column") or "").strip()
+        local_state["ts_is_analyzing"] = True
+        local_state["ts_analysis_summary"] = "Analysing…"
+        local_state["ts_pattern_model"] = None
+        safe_refresh(modeling_view)
+        try:
+            params: Dict[str, Any] = {"apply": True}
+            if time_col:
+                params["time_column"] = time_col
+            async with api_client(timeout=120.0) as client:
+                resp = await client.post(
+                    f"{BACKEND_URL}/project/{local_state['project_id']}/timeseries-analyze",
+                    params=params,
+                )
+                data = await parse_response(resp)
+            local_state["ts_pattern_model"] = data.get("pattern_model")
+            local_state["ts_analysis_summary"] = str(data.get("summary") or "Analysis complete.")
+            local_state["ts_time_column"] = str(data.get("time_column") or time_col)
+            detected_freq = str((data.get("pattern_model") or {}).get("inferred_frequency") or "D")
+            if not str(local_state.get("ts_frequency") or "").strip():
+                local_state["ts_frequency"] = detected_freq
+            safe_notify("Time Series analysis complete. Patterns stored.", notify_type="positive")
+        except Exception as ex:
+            local_state["ts_analysis_summary"] = f"Analysis failed: {ex}"
+            safe_notify(f"Time Series analysis failed: {ex}", notify_type="negative")
+        finally:
+            local_state["ts_is_analyzing"] = False
+            safe_refresh(modeling_view)
+            safe_refresh(generate_view)
 
     async def save_modeling_and_open_generate() -> None:
         if local_state.get("project_data"):
@@ -3683,6 +3744,18 @@ async def main_page() -> None:
                             variant="outline",
                             compact=True,
                         ).classes("w-full")
+                    action_button(
+                        "Clear Session",
+                        icon="cleaning_services",
+                        on_click=lambda: (
+                            close_profile_menu(),
+                            clear_active_project_state(clear_uploaded=True),
+                            switch_page("upload"),
+                            safe_notify("Session cleared. Start a new project.", notify_type="info"),
+                        ),
+                        variant="outline",
+                        compact=True,
+                    ).classes("w-full")
                     action_button(
                         "Logout",
                         icon="logout",
@@ -4419,6 +4492,91 @@ async def main_page() -> None:
                             "text-sm text-slate-500"
                         )
 
+            # ─── Time Series Card ──────────────────────────────────────────────
+            project_source = str(
+                (local_state.get("project_data") or {}).get("project", {}).get("source_type") or ""
+            ).upper()
+            if project_source == "CSV":
+                ts_exp = ui.expansion(
+                    "4) Time Series Mode (optional)", value=bool(local_state.get("ts_pattern_model"))
+                ).classes("glass-panel p-2 w-full")
+                attach_tooltip(
+                    ts_exp,
+                    "Enable to synthesize data that respects seasonal patterns, trend, and temporal "
+                    "autocorrelation detected in your source CSV.",
+                )
+                with ts_exp:
+                    with ui.row().classes("w-full items-center gap-4 mb-3"):
+                        ts_toggle = ui.switch(
+                            "Enable Time Series synthesis",
+                        ).bind_value(local_state, "ts_mode_enabled")
+                        ts_toggle.on(
+                            "update:model-value",
+                            lambda _: safe_refresh(modeling_view),
+                        )
+                        attach_tooltip(
+                            ts_toggle,
+                            "When on, the generator uses STL-detected seasonality + AR(1) residuals "
+                            "instead of a Gaussian Copula.",
+                        )
+
+                    with ui.column().classes("w-full gap-3"):
+                        ui.label(
+                            "Detect temporal patterns in your CSV and store them so the generator "
+                            "can produce realistic time-series output."
+                        ).classes("text-xs text-slate-500")
+
+                        with ui.row().classes("w-full items-end gap-3 flex-wrap"):
+                            tc_input = ui.input(
+                                "Date/time column (leave blank to auto-detect)",
+                                placeholder="e.g.  date",
+                            ).bind_value(local_state, "ts_time_column").classes("flex-1 min-w-[200px]")
+                            attach_tooltip(
+                                tc_input,
+                                "Name of the column that contains the timestamps. "
+                                "Leave empty to let the analyser auto-detect it.",
+                            )
+                            analyse_btn = action_button(
+                                "Analyse Time Series",
+                                icon="timeline",
+                                on_click=lambda: asyncio.create_task(analyze_timeseries()),
+                                variant="outline",
+                                compact=True,
+                            )
+                            analyse_btn.set_enabled(
+                                not bool(local_state.get("ts_is_analyzing"))
+                                and bool(local_state.get("project_id"))
+                            )
+
+                        if local_state.get("ts_is_analyzing"):
+                            with ui.row().classes("items-center gap-2 text-sky-700"):
+                                ui.spinner(size="sm")
+                                ui.label("Running STL decomposition…")
+                        elif local_state.get("ts_analysis_summary"):
+                            summary_color = (
+                                "text-emerald-700"
+                                if local_state.get("ts_pattern_model")
+                                else "text-red-500"
+                            )
+                            ui.label(str(local_state["ts_analysis_summary"])).classes(
+                                f"text-sm {summary_color} font-semibold"
+                            )
+
+                        if local_state.get("ts_pattern_model"):
+                            model = local_state["ts_pattern_model"]
+                            with ui.card().classes("bg-white/70 border border-slate-200 rounded p-3 w-full"):
+                                ui.label("Detected Columns").classes("text-xs font-bold text-slate-500 mb-1")
+                                cols_detected = model.get("numeric_columns", [])
+                                ui.label(
+                                    ", ".join(cols_detected) if cols_detected else "(none)"
+                                ).classes("text-sm text-slate-700")
+                                ui.label(
+                                    f"Seasonal period ≈ {model.get('seasonal_period', '?')} steps  ·  "
+                                    f"Frequency: {model.get('frequency_label', model.get('inferred_frequency', '?'))}"
+                                ).classes("text-xs text-slate-500 mt-1")
+
+            # ─── End Time Series Card ───────────────────────────────────────────
+
             with ui.row().classes(ACTION_BAR):
                 action_button("Back to Workspace", icon="arrow_back", on_click=lambda: go_to_page("project"), variant="outline")
                 clear_btn = action_button(
@@ -4474,6 +4632,67 @@ async def main_page() -> None:
                     "text-sm text-slate-500 mb-3"
                 )
             ui.radio(["csv", "parquet"], value="csv").bind_value(local_state, "output_format").props("inline")
+
+            # ── Time Series controls (shown when TS mode is enabled) ───────────
+            ts_enabled = bool(local_state.get("ts_mode_enabled")) and bool(local_state.get("ts_pattern_model"))
+            if ts_enabled:
+                ui.separator().classes("my-3 opacity-40")
+                with ui.column().classes("w-full gap-2"):
+                    ui.label("Time Series Parameters").classes(
+                        "text-sm font-bold"
+                    ).style("color: var(--nexus-brand);")
+                    ts_model = local_state.get("ts_pattern_model") or {}
+                    src_start = ts_model.get("source_start", "?")
+                    src_end = ts_model.get("source_end", "?")
+                    freq_label = ts_model.get("frequency_label", ts_model.get("inferred_frequency", "?"))
+                    ui.label(
+                        f"Source range: {src_start} → {src_end}  ·  Frequency: {freq_label}"
+                    ).classes("text-xs text-slate-500")
+                    ui.input(
+                        label="Start date (YYYY-MM-DD, leave blank for day after source end)",
+                        placeholder=f"e.g. {src_end}",
+                        on_change=lambda e: local_state.__setitem__("ts_start_date", str(e.value or "").strip()),
+                    ).bind_value(local_state, "ts_start_date").props("outlined").classes("w-full")
+                    attach_tooltip(
+                        ui.label(
+                            "Seasonal Amplitude Scale  (0.5 = halved · 1.0 = exact · 2.0 = doubled)"
+                        ).classes("text-xs text-slate-500 mt-1"),
+                        "Scales the amplitude of the seasonal component detected in your source data. "
+                        "1.0 reproduces the original seasonality faithfully.",
+                    )
+                    ts_slider = ui.slider(
+                        min=0.5, max=2.0, step=0.05,
+                        value=float(local_state.get("ts_seasonal_scale") or 1.0),
+                        on_change=lambda e: local_state.__setitem__(
+                            "ts_seasonal_scale", round(float(e.value or 1.0), 2)
+                        ),
+                    ).props("label-always snap").classes("w-full mt-1")
+                    ts_slider.bind_value(local_state, "ts_seasonal_scale")
+                    ui.label().bind_text_from(
+                        local_state, "ts_seasonal_scale",
+                        backward=lambda v: f"Scale: {float(v or 1.0):.2f}×"
+                    ).classes("text-xs font-semibold text-sky-700")
+                    # Override frequency
+                    freq_options = ["", "D", "W", "MS", "QS", "YS", "h", "min"]
+                    freq_labels = [
+                        "Auto (from model)", "Daily", "Weekly", "Monthly",
+                        "Quarterly", "Yearly", "Hourly", "Minutely"
+                    ]
+                    freq_map = dict(zip(freq_options, freq_labels))
+                    ui.select(
+                        {k: v for k, v in freq_map.items()},
+                        label="Override frequency (optional)",
+                        value=str(local_state.get("ts_frequency") or ""),
+                        on_change=lambda e: local_state.__setitem__("ts_frequency", str(e.value or "")),
+                    ).props("outlined").classes("w-full")
+            elif bool(local_state.get("ts_mode_enabled")) and not bool(local_state.get("ts_pattern_model")):
+                ui.separator().classes("my-3 opacity-40")
+                with ui.row().classes("items-center gap-2 text-amber-700 bg-amber-50 px-3 py-2 rounded"):
+                    ui.icon("warning", size="sm")
+                    ui.label(
+                        "Time Series is enabled but no pattern model found. "
+                        "Go to Modeling → Time Series Mode and run 'Analyse Time Series' first."
+                    ).classes("text-xs")
 
     @ui.refreshable
     def generate_view() -> None:

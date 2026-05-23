@@ -15,3 +15,4 @@ networkx
 pyarrow
 python-dotenv
 spacy
+statsmodels

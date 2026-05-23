@@ -7,7 +7,7 @@ def init_db():
     """Initializes the unified Studio metadata tables."""
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = duckdb.connect(DB_PATH)
-    
+
     # Unified Project Header
     conn.execute("""
     CREATE TABLE IF NOT EXISTS projects (
@@ -17,19 +17,19 @@ def init_db():
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     """)
-    
+
     # Unified Table Model
     conn.execute("""
     CREATE TABLE IF NOT EXISTS tables (
         id UUID PRIMARY KEY,
         project_id UUID,
         name VARCHAR,
-        file_path VARCHAR, 
+        file_path VARCHAR,
         row_count INTEGER,
         FOREIGN KEY (project_id) REFERENCES projects(id)
     )
     """)
-    
+
     # Unified Column Model (Merges DDL schema and CSV config)
     conn.execute("""
     CREATE TABLE IF NOT EXISTS columns (
@@ -58,7 +58,7 @@ def init_db():
         FOREIGN KEY (column_id) REFERENCES columns(id)
     )
     """)
-    
+
     # Unified Relationships
     conn.execute("""
     CREATE TABLE IF NOT EXISTS relations (
@@ -71,31 +71,33 @@ def init_db():
         FOREIGN KEY (project_id) REFERENCES projects(id)
     )
     """)
-    
-    # Migration: Ensure cardinality and is_optional exist
-    try:
-        conn.execute("ALTER TABLE relations ADD COLUMN IF NOT EXISTS cardinality VARCHAR DEFAULT '1:N'")
-        conn.execute("ALTER TABLE relations ADD COLUMN IF NOT EXISTS is_optional BOOLEAN DEFAULT TRUE")
-    except:
-        pass
 
-    # Migration: Ensure allowed_values exist
-    try:
-        conn.execute("ALTER TABLE columns ADD COLUMN IF NOT EXISTS allowed_values VARCHAR DEFAULT ''")
-        conn.execute("ALTER TABLE columns ADD COLUMN IF NOT EXISTS allowed_values_expanded VARCHAR DEFAULT ''")
-        conn.execute("ALTER TABLE columns ADD COLUMN IF NOT EXISTS expand_categories BOOLEAN DEFAULT FALSE")
-        conn.execute("ALTER TABLE columns ADD COLUMN IF NOT EXISTS output_format VARCHAR DEFAULT ''")
-    except:
-        pass
+    # ── Migrations — each ALTER in its own try/except ──────────────────────────
+    _migrations = [
+        # Relations extras
+        "ALTER TABLE relations ADD COLUMN IF NOT EXISTS cardinality VARCHAR DEFAULT '1:N'",
+        "ALTER TABLE relations ADD COLUMN IF NOT EXISTS is_optional BOOLEAN DEFAULT TRUE",
+        # Column extras
+        "ALTER TABLE columns ADD COLUMN IF NOT EXISTS allowed_values VARCHAR DEFAULT ''",
+        "ALTER TABLE columns ADD COLUMN IF NOT EXISTS allowed_values_expanded VARCHAR DEFAULT ''",
+        "ALTER TABLE columns ADD COLUMN IF NOT EXISTS expand_categories BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE columns ADD COLUMN IF NOT EXISTS output_format VARCHAR DEFAULT ''",
+        # Column profile extras
+        "ALTER TABLE column_profiles ADD COLUMN IF NOT EXISTS sd DOUBLE",
+        "ALTER TABLE column_profiles ADD COLUMN IF NOT EXISTS variance DOUBLE",
+        "ALTER TABLE column_profiles ADD COLUMN IF NOT EXISTS null_value_percent DOUBLE",
+        # Time-series pattern model storage
+        "ALTER TABLE projects ADD COLUMN IF NOT EXISTS is_timeseries BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE projects ADD COLUMN IF NOT EXISTS timeseries_model TEXT DEFAULT NULL",
+        "ALTER TABLE projects ADD COLUMN IF NOT EXISTS ts_time_column VARCHAR DEFAULT NULL",
+        "ALTER TABLE projects ADD COLUMN IF NOT EXISTS ts_frequency VARCHAR DEFAULT NULL",
+    ]
+    for _stmt in _migrations:
+        try:
+            conn.execute(_stmt)
+        except Exception:
+            pass
 
-    # Migration: Add sd, variance, null_value_percent to column_profiles
-    try:
-        conn.execute("ALTER TABLE column_profiles ADD COLUMN IF NOT EXISTS sd DOUBLE")
-        conn.execute("ALTER TABLE column_profiles ADD COLUMN IF NOT EXISTS variance DOUBLE")
-        conn.execute("ALTER TABLE column_profiles ADD COLUMN IF NOT EXISTS null_value_percent DOUBLE")
-    except:
-        pass
-        
     conn.close()
 
 def get_db_connection():
