@@ -16,3 +16,6 @@ local
 .nicegui
 .venv
 .vscode
+.agents/
+PAGE_FLOW.md
+PRD.md

@@ -3,29 +3,57 @@ services:
     build:
       context: .
       dockerfile: backend/Dockerfile
-    container_name: datacosmos-backend
-    env_file:
-      - .env
-    working_dir: /app/backend
+    environment:
+      AUTH_USERNAME: ${AUTH_USERNAME:-admin}
+      AUTH_PASSWORD: ${AUTH_PASSWORD:-change-me}
+      SUPER_ADMIN_USERNAME: ${SUPER_ADMIN_USERNAME:-superadmin}
+      SUPER_ADMIN_PASSWORD: ${SUPER_ADMIN_PASSWORD:-change-me-too}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GROQ_API_URL: ${GROQ_API_URL:-https://api.groq.com/openai/v1/chat/completions}
+      GROQ_MODEL: ${GROQ_MODEL:-llama-3.1-8b-instant}
+      GROQ_SUMMARY_MODEL: ${GROQ_SUMMARY_MODEL:-llama-3.1-8b-instant}
+      GROQ_REL_MODEL: ${GROQ_REL_MODEL:-llama-3.1-8b-instant}
+      GROQ_ASSISTANT_MODEL: ${GROQ_ASSISTANT_MODEL:-llama-3.1-8b-instant}
+      MAX_CSV_UPLOAD_MB: ${MAX_CSV_UPLOAD_MB:-50}
+      MAX_DDL_UPLOAD_MB: ${MAX_DDL_UPLOAD_MB:-50}
     ports:
       - "8000:8000"
     volumes:
-      - ./backend/data:/app/backend/data
+      - backend-data:/app/backend/data
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8000/ >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 45s
 
   frontend:
     build:
       context: .
       dockerfile: frontend/Dockerfile
-    container_name: datacosmos-frontend
-    env_file:
-      - .env
     environment:
-      NICEGUI_HOST: 0.0.0.0
-      NICEGUI_PORT: 8181
-      NICEGUI_STORAGE_SECRET: nexus-local-dev-secret-change-me
+      BACKEND_URL: http://backend:8000
+      UI_TIMEZONE: ${UI_TIMEZONE:-Asia/Kolkata}
+      UPLOAD_REQUEST_TIMEOUT: ${UPLOAD_REQUEST_TIMEOUT:-300}
+      MAX_CSV_UPLOAD_MB: ${MAX_CSV_UPLOAD_MB:-50}
+      MAX_DDL_UPLOAD_MB: ${MAX_DDL_UPLOAD_MB:-50}
+      NICEGUI_STORAGE_SECRET: ${NICEGUI_STORAGE_SECRET:-change-me-local-only}
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     ports:
       - "8181:8181"
+    volumes:
+      - frontend-state:/app/frontend/.nicegui
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8181/ >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 45s
+
+volumes:
+  backend-data:
+  frontend-state:
