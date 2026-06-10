@@ -172,13 +172,14 @@ jobs:
         uses: SonarSource/sonarqube-scan-action@v8.2.0
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
         with:
           projectBaseDir: .
           args: >
-            -Dsonar.projectKey=${{ vars.SONAR_PROJECT_KEY }}
+            -Dsonar.organization="${{ vars.SONAR_ORGANIZATION }}"
+            -Dsonar.projectKey="${{ vars.SONAR_PROJECT_KEY }}"
             -Dsonar.projectName="Data Cosmos"
-            -Dsonar.sources=backend,frontend,main.py
-            -Dsonar.tests=tests
-            -Dsonar.test.inclusions=tests/**/*.py
-            -Dsonar.exclusions=backend/data/**,frontend/.nicegui/**,**/*.db,**/*.log,**/*.ipynb,**/*.authbak
+            -Dsonar.sources="backend,frontend,main.py"
+            -Dsonar.tests="tests"
+            -Dsonar.test.inclusions="tests/**/*.py"
+            -Dsonar.exclusions="backend/data/**,frontend/.nicegui/**,**/*.db,**/*.log,**/*.ipynb,**/*.authbak"
