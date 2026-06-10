@@ -176,8 +176,8 @@ jobs:
         with:
           projectBaseDir: .
           args: >
-            -Dsonar.organization="${{ vars.SONAR_ORGANIZATION }}"
-            -Dsonar.projectKey="${{ vars.SONAR_PROJECT_KEY }}"
+            -Dsonar.organization=${{ vars.SONAR_ORGANIZATION }}
+            -Dsonar.projectKey=${{ vars.SONAR_PROJECT_KEY }}
             -Dsonar.projectName="Data Cosmos"
             -Dsonar.sources="."
             -Dsonar.tests="tests"
