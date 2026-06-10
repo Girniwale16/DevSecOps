@@ -177,7 +177,7 @@ jobs:
           projectBaseDir: .
           args: >
             -Dsonar.projectKey=${{ vars.SONAR_PROJECT_KEY }}
-            -Dsonar.projectName=Data Cosmos
+            -Dsonar.projectName="Data Cosmos"
             -Dsonar.sources=backend,frontend,main.py
             -Dsonar.tests=tests
             -Dsonar.test.inclusions=tests/**/*.py
