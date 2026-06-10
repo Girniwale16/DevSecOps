@@ -1,0 +1,245 @@
+name: DevSecOps Scan
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+jobs:
+  gitleaks-scan:
+    name: Gitleaks Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run Gitleaks scan
+        id: gitleaks-scan
+        continue-on-error: true
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/repo" \
+            ghcr.io/gitleaks/gitleaks:v8.24.2 \
+            detect --source /repo --redact --report-format sarif --report-path /repo/gitleaks.sarif
+
+      - name: Upload Gitleaks SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: gitleaks.sarif
+
+      - name: Fail on Gitleaks findings
+        if: ${{ steps.gitleaks-scan.outcome == 'failure' }}
+        run: exit 1
+
+  sca-trivy-scan:
+    name: Trivy SCA Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run Trivy filesystem scan
+        id: trivy-scan
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          format: sarif
+          output: trivy-fs.sarif
+          exit-code: "1"
+
+      - name: Upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-fs.sarif
+
+      - name: Fail on Trivy findings
+        if: ${{ steps.trivy-scan.outcome == 'failure' }}
+        run: exit 1
+
+  container-grype-scan:
+    name: Grype Container Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build backend image
+        run: |
+          docker build \
+            -f backend/Dockerfile \
+            -t data-cosmos-backend:${{ github.sha }} \
+            .
+
+      - name: Build frontend image
+        run: |
+          docker build \
+            -f frontend/Dockerfile \
+            -t data-cosmos-frontend:${{ github.sha }} \
+            .
+
+      - name: Scan backend image with Grype
+        id: grype-backend-scan
+        continue-on-error: true
+        run: |
+          docker run --rm \
+            anchore/grype:v0.87.0 \
+            data-cosmos-backend:${{ github.sha }} \
+            --fail-on high \
+            --output sarif > grype-backend.sarif
+
+      - name: Scan frontend image with Grype
+        id: grype-frontend-scan
+        continue-on-error: true
+        run: |
+          docker run --rm \
+            anchore/grype:v0.87.0 \
+            data-cosmos-frontend:${{ github.sha }} \
+            --fail-on high \
+            --output sarif > grype-frontend.sarif
+
+      - name: Upload backend Grype SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: grype-backend.sarif
+
+      - name: Upload frontend Grype SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: grype-frontend.sarif
+
+      - name: Fail on Grype findings
+        if: ${{ steps.grype-backend-scan.outcome == 'failure' || steps.grype-frontend-scan.outcome == 'failure' }}
+        run: exit 1
+
+  hadolint-scan:
+    name: Hadolint Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Lint backend Dockerfile
+        id: hadolint-backend-scan
+        continue-on-error: true
+        run: |
+          docker run --rm -i \
+            hadolint/hadolint:v2.12.0 \
+            hadolint -f sarif /dev/stdin < backend/Dockerfile > backend-hadolint.sarif
+
+      - name: Lint frontend Dockerfile
+        id: hadolint-frontend-scan
+        continue-on-error: true
+        run: |
+          docker run --rm -i \
+            hadolint/hadolint:v2.12.0 \
+            hadolint -f sarif /dev/stdin < frontend/Dockerfile > frontend-hadolint.sarif
+
+      - name: Upload backend Hadolint SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: backend-hadolint.sarif
+
+      - name: Upload frontend Hadolint SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: frontend-hadolint.sarif
+
+      - name: Fail on Hadolint findings
+        if: ${{ steps.hadolint-backend-scan.outcome == 'failure' || steps.hadolint-frontend-scan.outcome == 'failure' }}
+        run: exit 1
+
+  checkov-scan:
+    name: Checkov Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install Checkov
+        run: python -m pip install --upgrade pip checkov
+
+      - name: Run Checkov
+        id: checkov-scan
+        continue-on-error: true
+        run: >
+          checkov
+          --directory .
+          --framework terraform,kubernetes,cloudformation,helm,dockerfile,docker_compose
+          --quiet
+          --output sarif
+          --output-file-path checkov.sarif
+
+      - name: Upload Checkov SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: checkov.sarif
+
+      - name: Fail on Checkov findings
+        if: ${{ steps.checkov-scan.outcome == 'failure' }}
+        run: exit 1
+
+  sonarqube-scan:
+    name: SonarQube Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install project dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r backend/requirements.txt
+          python -m pip install -r frontend/requirements.txt
+
+      - name: Check SonarQube configuration
+        id: sonar-config
+        env:
+          SONAR_PROJECT_KEY: ${{ vars.SONAR_PROJECT_KEY }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        run: |
+          if [ -n "$SONAR_PROJECT_KEY" ] && [ -n "$SONAR_TOKEN" ] && [ -n "$SONAR_HOST_URL" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run SonarQube scan
+        if: ${{ steps.sonar-config.outputs.enabled == 'true' }}
+        uses: SonarSource/sonarqube-scan-action@v5.0.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        with:
+          args: >
+            -Dsonar.projectKey=${{ vars.SONAR_PROJECT_KEY }}
+            -Dsonar.sources=.
+            -Dsonar.exclusions=**/.venv/**,**/__pycache__/**,**/node_modules/**,**/dist/**,**/build/**,**/*.ipynb
