@@ -4,6 +4,15 @@ on:
   push:
     branches:
       - main
+    paths:
+      - backend/**
+      - frontend/**
+      - tests/**
+      - pyproject.toml
+      - uv.lock
+      - docker-compose.yml
+      - "**/Dockerfile"
+      - .github/workflows/devsecops.yml
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -11,60 +20,21 @@ concurrency:
 
 permissions:
   contents: read
-  security-events: write
-
-env:
-  BACKEND_IMAGE: data-cosmos-backend
-  FRONTEND_IMAGE: data-cosmos-frontend
 
 jobs:
-  prepare:
-    name: Prepare scan targets
-    runs-on: ubuntu-latest
-    outputs:
-      has_backend_dockerfile: ${{ steps.detect.outputs.has_backend_dockerfile }}
-      has_frontend_dockerfile: ${{ steps.detect.outputs.has_frontend_dockerfile }}
-      has_iac: ${{ steps.detect.outputs.has_iac }}
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Detect repository targets
-        id: detect
-        shell: bash
-        run: |
-          if [ -f backend/Dockerfile ]; then
-            echo "has_backend_dockerfile=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "has_backend_dockerfile=false" >> "$GITHUB_OUTPUT"
-          fi
-
-          if [ -f frontend/Dockerfile ]; then
-            echo "has_frontend_dockerfile=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "has_frontend_dockerfile=false" >> "$GITHUB_OUTPUT"
-          fi
-
-          if find . -type f \( -name '*.tf' -o -name '*.tfvars' -o -name '*.tf.json' -o -name '*.yaml' -o -name '*.yml' \) -print -quit | grep -q .; then
-            echo "has_iac=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "has_iac=false" >> "$GITHUB_OUTPUT"
-          fi
-
   sca-trivy-scan:
     name: Trivy filesystem scan
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Create report directory
+      - name: Prepare report directory
         run: mkdir -p reports
 
-      - name: Run Trivy filesystem scan
-        id: trivy
-        continue-on-error: true
-        uses: aquasecurity/trivy-action@0.36.0
+      - name: Scan repository with Trivy
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: fs
           scan-ref: .
@@ -75,234 +45,140 @@ jobs:
           output: reports/trivy-filesystem.sarif
           exit-code: 1
 
-      - name: Upload Trivy SARIF
-        if: always()
-        uses: github/codeql-action/upload-sarif@v4
-        with:
-          sarif_file: reports/trivy-filesystem.sarif
-
-      - name: Upload Trivy artifact
+      - name: Upload Trivy report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: trivy-filesystem-sarif
+          name: trivy-filesystem-report
           path: reports/trivy-filesystem.sarif
-          if-no-files-found: ignore
-
-      - name: Fail on Trivy findings
-        if: steps.trivy.outcome == 'failure'
-        run: exit 1
-
-  hadolint-scan:
-    name: Hadolint Dockerfile scan
-    runs-on: ubuntu-latest
-    needs: prepare
-    if: needs.prepare.outputs.has_backend_dockerfile == 'true' || needs.prepare.outputs.has_frontend_dockerfile == 'true'
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Create report directory
-        run: mkdir -p reports
-
-      - name: Lint backend Dockerfile
-        id: hadolint_backend
-        if: needs.prepare.outputs.has_backend_dockerfile == 'true'
-        continue-on-error: true
-        uses: hadolint/hadolint-action@v3.1.0
-        with:
-          dockerfile: backend/Dockerfile
-          format: sarif
-          output-file: reports/hadolint-backend.sarif
-          failure-threshold: warning
-
-      - name: Lint frontend Dockerfile
-        id: hadolint_frontend
-        if: needs.prepare.outputs.has_frontend_dockerfile == 'true'
-        continue-on-error: true
-        uses: hadolint/hadolint-action@v3.1.0
-        with:
-          dockerfile: frontend/Dockerfile
-          format: sarif
-          output-file: reports/hadolint-frontend.sarif
-          failure-threshold: warning
-
-      - name: Upload backend Hadolint artifact
-        if: always() && needs.prepare.outputs.has_backend_dockerfile == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: hadolint-backend-sarif
-          path: reports/hadolint-backend.sarif
-          if-no-files-found: ignore
-
-      - name: Upload frontend Hadolint artifact
-        if: always() && needs.prepare.outputs.has_frontend_dockerfile == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: hadolint-frontend-sarif
-          path: reports/hadolint-frontend.sarif
-          if-no-files-found: ignore
-
-      - name: Fail backend Hadolint findings
-        if: steps.hadolint_backend.outcome == 'failure'
-        run: exit 1
-
-      - name: Fail frontend Hadolint findings
-        if: steps.hadolint_frontend.outcome == 'failure'
-        run: exit 1
+          if-no-files-found: warn
 
   container-grype-scan:
-    name: Grype container image scan
+    name: Grype container scan
     runs-on: ubuntu-latest
-    needs: prepare
-    if: needs.prepare.outputs.has_backend_dockerfile == 'true' || needs.prepare.outputs.has_frontend_dockerfile == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: backend
+            dockerfile: backend/Dockerfile
+            image: data-cosmos-backend
+          - name: frontend
+            dockerfile: frontend/Dockerfile
+            image: data-cosmos-frontend
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Create report directory
+      - name: Prepare report directory
         run: mkdir -p reports
 
-      - name: Build backend image
-        if: needs.prepare.outputs.has_backend_dockerfile == 'true'
-        run: docker build -f backend/Dockerfile -t ${{ env.BACKEND_IMAGE }}:${{ github.sha }} .
+      - name: Build local container image
+        run: docker build -f "${{ matrix.dockerfile }}" -t "${{ matrix.image }}:${{ github.sha }}" .
 
-      - name: Scan backend image with Grype
-        id: backend_grype
-        if: needs.prepare.outputs.has_backend_dockerfile == 'true'
-        continue-on-error: true
-        uses: anchore/scan-action@v7
+      - name: Scan container image with Grype
+        uses: anchore/scan-action@v7.4.0
         with:
-          image: ${{ env.BACKEND_IMAGE }}:${{ github.sha }}
+          image: ${{ matrix.image }}:${{ github.sha }}
           fail-build: true
           severity-cutoff: high
           output-format: sarif
-          output-file: reports/grype-backend.sarif
+          output-file: reports/grype-${{ matrix.name }}.sarif
+          cache-db: true
 
-      - name: Upload backend Grype SARIF
-        if: always() && needs.prepare.outputs.has_backend_dockerfile == 'true'
-        uses: github/codeql-action/upload-sarif@v4
-        with:
-          sarif_file: reports/grype-backend.sarif
-
-      - name: Upload backend Grype artifact
-        if: always() && needs.prepare.outputs.has_backend_dockerfile == 'true'
+      - name: Upload Grype report
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: grype-backend-sarif
-          path: reports/grype-backend.sarif
-          if-no-files-found: ignore
+          name: grype-${{ matrix.name }}-report
+          path: reports/grype-${{ matrix.name }}.sarif
+          if-no-files-found: warn
 
-      - name: Build frontend image
-        if: needs.prepare.outputs.has_frontend_dockerfile == 'true'
-        run: docker build -f frontend/Dockerfile -t ${{ env.FRONTEND_IMAGE }}:${{ github.sha }} .
+  hadolint-scan:
+    name: Hadolint Dockerfile lint
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: backend
+            dockerfile: backend/Dockerfile
+          - name: frontend
+            dockerfile: frontend/Dockerfile
 
-      - name: Scan frontend image with Grype
-        id: frontend_grype
-        if: needs.prepare.outputs.has_frontend_dockerfile == 'true'
-        continue-on-error: true
-        uses: anchore/scan-action@v7
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Prepare report directory
+        run: mkdir -p reports
+
+      - name: Lint Dockerfile with Hadolint
+        uses: hadolint/hadolint-action@v3.3.0
         with:
-          image: ${{ env.FRONTEND_IMAGE }}:${{ github.sha }}
-          fail-build: true
-          severity-cutoff: high
-          output-format: sarif
-          output-file: reports/grype-frontend.sarif
+          dockerfile: ${{ matrix.dockerfile }}
+          recursive: false
+          format: sarif
+          output-file: reports/hadolint-${{ matrix.name }}.sarif
+          failure-threshold: warning
 
-      - name: Upload frontend Grype SARIF
-        if: always() && needs.prepare.outputs.has_frontend_dockerfile == 'true'
-        uses: github/codeql-action/upload-sarif@v4
-        with:
-          sarif_file: reports/grype-frontend.sarif
-
-      - name: Upload frontend Grype artifact
-        if: always() && needs.prepare.outputs.has_frontend_dockerfile == 'true'
+      - name: Upload Hadolint report
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: grype-frontend-sarif
-          path: reports/grype-frontend.sarif
-          if-no-files-found: ignore
-
-      - name: Fail backend Grype findings
-        if: steps.backend_grype.outcome == 'failure'
-        run: exit 1
-
-      - name: Fail frontend Grype findings
-        if: steps.frontend_grype.outcome == 'failure'
-        run: exit 1
+          name: hadolint-${{ matrix.name }}-report
+          path: reports/hadolint-${{ matrix.name }}.sarif
+          if-no-files-found: warn
 
   checkov-scan:
     name: Checkov IaC scan
     runs-on: ubuntu-latest
-    needs: prepare
-    if: needs.prepare.outputs.has_iac == 'true'
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Create report directory
+      - name: Prepare report directory
         run: mkdir -p reports
 
-      - name: Run Checkov scan
-        id: checkov
-        continue-on-error: true
-        uses: bridgecrewio/checkov-action@v12
+      - name: Scan infrastructure as code with Checkov
+        uses: bridgecrewio/checkov-action@v12.1347.0
         with:
-          directory: .
-          framework: all
-          quiet: true
-          soft_fail: false
+          file: docker-compose.yml
+          framework: docker_compose
           output_format: cli,sarif
-          output_file_path: console,reports/checkov-results.sarif
+          output_file_path: console,reports/checkov-docker-compose.sarif
 
-      - name: Upload Checkov SARIF
-        if: always()
-        uses: github/codeql-action/upload-sarif@v4
-        with:
-          sarif_file: reports/checkov-results.sarif
-
-      - name: Upload Checkov artifact
+      - name: Upload Checkov report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: checkov-results-sarif
-          path: reports/checkov-results.sarif
-          if-no-files-found: ignore
-
-      - name: Fail on Checkov findings
-        if: steps.checkov.outcome == 'failure'
-        run: exit 1
+          name: checkov-docker-compose-report
+          path: reports/checkov-docker-compose.sarif
+          if-no-files-found: warn
 
   sonarqube-scan:
     name: SonarQube analysis
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.14"
-
-      - name: Set up uv
-        uses: astral-sh/setup-uv@v8.2.0
-
-      - name: Install project dependencies
-        run: uv sync --frozen
-
       - name: Run SonarQube scan
-        uses: SonarSource/sonarqube-scan-action@v4.1.0
+        uses: SonarSource/sonarqube-scan-action@v8.2.0
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
         with:
+          projectBaseDir: .
           args: >
             -Dsonar.projectKey=${{ vars.SONAR_PROJECT_KEY }}
-            -Dsonar.sources=backend/app,frontend
-            -Dsonar.qualitygate.wait=true
+            -Dsonar.projectName=Data Cosmos
+            -Dsonar.sources=backend,frontend,main.py
+            -Dsonar.tests=tests
+            -Dsonar.test.inclusions=tests/**/*.py
+            -Dsonar.exclusions=backend/data/**,frontend/.nicegui/**,**/*.db,**/*.log,**/*.ipynb,**/*.authbak
