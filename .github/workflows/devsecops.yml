@@ -4,7 +4,22 @@ on:
   push:
     branches:
       - main
-  workflow_dispatch:
+    paths:
+      - "backend/**"
+      - "frontend/**"
+      - "tests/**"
+      - "docker-compose.yml"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "backend/requirements.txt"
+      - "frontend/requirements.txt"
+      - "**/*.py"
+      - "**/*.yml"
+      - "**/*.yaml"
+      - "**/Dockerfile"
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: read
@@ -15,13 +30,12 @@ jobs:
   sca-trivy-scan:
     name: Trivy SCA Scan
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Run Trivy filesystem scan
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: fs
           scan-ref: .
@@ -30,9 +44,9 @@ jobs:
           ignore-unfixed: true
           format: sarif
           output: trivy-fs.sarif
-          exit-code: "1"
 
       - name: Upload Trivy SARIF
+        if: always()
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: trivy-fs.sarif
@@ -40,46 +54,64 @@ jobs:
   container-grype-scan:
     name: Grype Container Scan
     runs-on: ubuntu-latest
-    if: ${{ hashFiles('backend/Dockerfile', 'frontend/Dockerfile') != '' }}
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Detect Dockerfiles
+        id: detect
+        shell: bash
+        run: |
+          backend=false
+          frontend=false
+
+          if [ -f backend/Dockerfile ]; then
+            backend=true
+          fi
+
+          if [ -f frontend/Dockerfile ]; then
+            frontend=true
+          fi
+
+          echo "backend=$backend" >> "$GITHUB_OUTPUT"
+          echo "frontend=$frontend" >> "$GITHUB_OUTPUT"
+
       - name: Build backend image
-        if: ${{ hashFiles('backend/Dockerfile') != '' }}
+        if: steps.detect.outputs.backend == 'true'
         run: docker build -f backend/Dockerfile -t data-cosmos-backend:${{ github.sha }} .
 
       - name: Scan backend image with Grype
-        if: ${{ hashFiles('backend/Dockerfile') != '' }}
-        uses: anchore/scan-action@v4
+        if: steps.detect.outputs.backend == 'true'
+        uses: anchore/scan-action@v7.4.0
         with:
           image: data-cosmos-backend:${{ github.sha }}
           fail-build: true
+          severity-cutoff: high
           output-format: sarif
           output-file: backend-grype.sarif
 
       - name: Upload backend Grype SARIF
-        if: ${{ hashFiles('backend-grype.sarif') != '' }}
+        if: always() && steps.detect.outputs.backend == 'true'
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: backend-grype.sarif
 
       - name: Build frontend image
-        if: ${{ hashFiles('frontend/Dockerfile') != '' }}
+        if: steps.detect.outputs.frontend == 'true'
         run: docker build -f frontend/Dockerfile -t data-cosmos-frontend:${{ github.sha }} .
 
       - name: Scan frontend image with Grype
-        if: ${{ hashFiles('frontend/Dockerfile') != '' }}
-        uses: anchore/scan-action@v4
+        if: steps.detect.outputs.frontend == 'true'
+        uses: anchore/scan-action@v7.4.0
         with:
           image: data-cosmos-frontend:${{ github.sha }}
           fail-build: true
+          severity-cutoff: high
           output-format: sarif
           output-file: frontend-grype.sarif
 
       - name: Upload frontend Grype SARIF
-        if: ${{ hashFiles('frontend-grype.sarif') != '' }}
+        if: always() && steps.detect.outputs.frontend == 'true'
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: frontend-grype.sarif
@@ -87,15 +119,31 @@ jobs:
   hadolint-scan:
     name: Hadolint Scan
     runs-on: ubuntu-latest
-    if: ${{ hashFiles('backend/Dockerfile', 'frontend/Dockerfile') != '' }}
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Run Hadolint on backend Dockerfile
-        if: ${{ hashFiles('backend/Dockerfile') != '' }}
-        uses: hadolint/hadolint-action@v3.1.0
+      - name: Detect Dockerfiles
+        id: detect
+        shell: bash
+        run: |
+          backend=false
+          frontend=false
+
+          if [ -f backend/Dockerfile ]; then
+            backend=true
+          fi
+
+          if [ -f frontend/Dockerfile ]; then
+            frontend=true
+          fi
+
+          echo "backend=$backend" >> "$GITHUB_OUTPUT"
+          echo "frontend=$frontend" >> "$GITHUB_OUTPUT"
+
+      - name: Lint backend Dockerfile
+        if: steps.detect.outputs.backend == 'true'
+        uses: hadolint/hadolint-action@v3.3.0
         with:
           dockerfile: backend/Dockerfile
           failure-threshold: warning
@@ -103,14 +151,14 @@ jobs:
           output-file: backend-hadolint.sarif
 
       - name: Upload backend Hadolint SARIF
-        if: ${{ hashFiles('backend-hadolint.sarif') != '' }}
+        if: always() && steps.detect.outputs.backend == 'true'
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: backend-hadolint.sarif
 
-      - name: Run Hadolint on frontend Dockerfile
-        if: ${{ hashFiles('frontend/Dockerfile') != '' }}
-        uses: hadolint/hadolint-action@v3.1.0
+      - name: Lint frontend Dockerfile
+        if: steps.detect.outputs.frontend == 'true'
+        uses: hadolint/hadolint-action@v3.3.0
         with:
           dockerfile: frontend/Dockerfile
           failure-threshold: warning
@@ -118,7 +166,7 @@ jobs:
           output-file: frontend-hadolint.sarif
 
       - name: Upload frontend Hadolint SARIF
-        if: ${{ hashFiles('frontend-hadolint.sarif') != '' }}
+        if: always() && steps.detect.outputs.frontend == 'true'
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: frontend-hadolint.sarif
@@ -126,23 +174,22 @@ jobs:
   checkov-scan:
     name: Checkov Scan
     runs-on: ubuntu-latest
-    if: ${{ hashFiles('docker-compose.yml', 'backend/Dockerfile', 'frontend/Dockerfile') != '' }}
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Run Checkov
-        uses: bridgecrewio/checkov-action@v12
+      - name: Run Checkov on docker-compose
+        uses: bridgecrewio/checkov-action@v12.1347.0
         with:
           directory: .
-          framework: dockerfile,docker_compose
+          file: docker-compose.yml
+          framework: docker_compose
           output_format: sarif
           output_file_path: checkov-results.sarif
           soft_fail: false
 
       - name: Upload Checkov SARIF
-        if: ${{ hashFiles('checkov-results.sarif') != '' }}
+        if: always()
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: checkov-results.sarif
@@ -150,7 +197,6 @@ jobs:
   sonarqube-scan:
     name: SonarQube Scan
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -160,35 +206,15 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.14"
-
-      - name: Install project dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r backend/requirements.txt
-          python -m pip install -r frontend/requirements.txt
-
-      - name: Check SonarQube configuration
-        id: sonar-config
-        env:
-          SONAR_PROJECT_KEY: ${{ vars.SONAR_PROJECT_KEY }}
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
-        run: |
-          if [ -n "$SONAR_PROJECT_KEY" ] && [ -n "$SONAR_TOKEN" ] && [ -n "$SONAR_HOST_URL" ]; then
-            echo "enabled=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
-          fi
+          python-version-file: .python-version
 
       - name: Run SonarQube scan
-        if: ${{ steps.sonar-config.outputs.enabled == 'true' }}
-        uses: SonarSource/sonarqube-scan-action@v5.0.0
+        uses: SonarSource/sonarqube-scan-action@v8.1.0
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
         with:
           args: >
             -Dsonar.projectKey=${{ vars.SONAR_PROJECT_KEY }}
-            -Dsonar.sources=backend,frontend
-            -Dsonar.exclusions=**/.venv/**,**/__pycache__/**,**/node_modules/**,**/dist/**,**/build/**,**/*.ipynb
+            -Dsonar.sources=.
+            -Dsonar.exclusions=**/.git/**,**/.venv/**,**/__pycache__/**,**/*.authbak,**/*.log,backend/data/**,tests/samples/**
