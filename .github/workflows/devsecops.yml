@@ -179,7 +179,7 @@ jobs:
             -Dsonar.organization="${{ vars.SONAR_ORGANIZATION }}"
             -Dsonar.projectKey="${{ vars.SONAR_PROJECT_KEY }}"
             -Dsonar.projectName="Data Cosmos"
-            -Dsonar.sources="backend,frontend,main.py"
+            -Dsonar.sources="."
             -Dsonar.tests="tests"
             -Dsonar.test.inclusions="tests/**/*.py"
             -Dsonar.exclusions="backend/data/**,frontend/.nicegui/**,**/*.db,**/*.log,**/*.ipynb,**/*.authbak"
