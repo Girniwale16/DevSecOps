@@ -13,6 +13,7 @@ on:
       - docker-compose.yml
       - "**/Dockerfile"
       - .github/workflows/devsecops.yml
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
