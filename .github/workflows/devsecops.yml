@@ -8,36 +8,24 @@ on:
       - "backend/**"
       - "frontend/**"
       - "tests/**"
+      - "main.py"
       - "pyproject.toml"
       - "uv.lock"
+      - "backend/requirements.txt"
+      - "frontend/requirements.txt"
+      - "backend/Dockerfile"
+      - "frontend/Dockerfile"
       - "docker-compose.yml"
-      - ".trivyignore"
-      - ".grype.yaml"
-      - ".hadolint.yaml"
-      - ".checkov.baseline"
-      - "sonar-project.properties"
-      - "**/Dockerfile"
-      - "**/*.tf"
-      - "**/*.tfvars"
-      - "**/*.yaml"
-      - "**/*.yml"
-      - "**/kustomization.yaml"
-      - ".github/workflows/devsecops.yml"
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
 
 permissions:
   contents: read
-  actions: read
   security-events: write
+  actions: read
 
 jobs:
   sca-trivy-scan:
     name: Trivy SCA Scan
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -71,24 +59,25 @@ jobs:
   container-grype-scan:
     name: Grype Container Scan
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Build backend image
+        if: ${{ hashFiles('backend/Dockerfile') != '' }}
         run: docker build -f backend/Dockerfile -t data-cosmos-backend:${{ github.sha }} .
 
       - name: Scan backend image with Grype
+        if: ${{ hashFiles('backend/Dockerfile') != '' }}
         uses: anchore/scan-action@v7.4.0
         with:
           image: data-cosmos-backend:${{ github.sha }}
-          fail-build: false
+          fail-build: true
           output-format: sarif
           output-file: backend-grype.sarif
 
       - name: Upload backend Grype SARIF
-        if: github.repository_visibility == 'public'
+        if: ${{ hashFiles('backend/Dockerfile') != '' }} && github.repository_visibility == 'public'
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: backend-grype.sarif
@@ -102,18 +91,20 @@ jobs:
           if-no-files-found: ignore
 
       - name: Build frontend image
+        if: ${{ hashFiles('frontend/Dockerfile') != '' }}
         run: docker build -f frontend/Dockerfile -t data-cosmos-frontend:${{ github.sha }} .
 
       - name: Scan frontend image with Grype
+        if: ${{ hashFiles('frontend/Dockerfile') != '' }}
         uses: anchore/scan-action@v7.4.0
         with:
           image: data-cosmos-frontend:${{ github.sha }}
-          fail-build: false
+          fail-build: true
           output-format: sarif
           output-file: frontend-grype.sarif
 
       - name: Upload frontend Grype SARIF
-        if: github.repository_visibility == 'public'
+        if: ${{ hashFiles('frontend/Dockerfile') != '' }} && github.repository_visibility == 'public'
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: frontend-grype.sarif
@@ -129,13 +120,12 @@ jobs:
   hadolint-scan:
     name: Hadolint Scan
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Run Hadolint on backend Dockerfile
-        continue-on-error: true
+        if: ${{ hashFiles('backend/Dockerfile') != '' }}
         uses: hadolint/hadolint-action@v3.3.0
         with:
           dockerfile: backend/Dockerfile
@@ -144,7 +134,7 @@ jobs:
           output-file: backend-hadolint.sarif
 
       - name: Upload backend Hadolint SARIF
-        if: github.repository_visibility == 'public'
+        if: ${{ hashFiles('backend/Dockerfile') != '' }} && github.repository_visibility == 'public'
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: backend-hadolint.sarif
@@ -158,7 +148,7 @@ jobs:
           if-no-files-found: ignore
 
       - name: Run Hadolint on frontend Dockerfile
-        continue-on-error: true
+        if: ${{ hashFiles('frontend/Dockerfile') != '' }}
         uses: hadolint/hadolint-action@v3.3.0
         with:
           dockerfile: frontend/Dockerfile
@@ -167,7 +157,7 @@ jobs:
           output-file: frontend-hadolint.sarif
 
       - name: Upload frontend Hadolint SARIF
-        if: github.repository_visibility == 'public'
+        if: ${{ hashFiles('frontend/Dockerfile') != '' }} && github.repository_visibility == 'public'
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: frontend-hadolint.sarif
@@ -183,19 +173,18 @@ jobs:
   checkov-scan:
     name: Checkov Scan
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Run Checkov against docker-compose
+      - name: Run Checkov
         uses: bridgecrewio/checkov-action@v12.1347.0
         with:
-          file: docker-compose.yml
-          framework: docker_compose
+          directory: .
+          framework: terraform,kubernetes,cloudformation,helm
           output_format: sarif
           output_file_path: checkov-results.sarif
-          soft_fail: true
+          soft_fail: false
 
       - name: Upload Checkov SARIF
         if: github.repository_visibility == 'public'
@@ -214,7 +203,6 @@ jobs:
   sonarqube-scan:
     name: SonarQube Scan
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -224,13 +212,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version-file: .python-version
-
-      - name: Set up uv
-        uses: astral-sh/setup-uv@v8.2.0
-
-      - name: Install dependencies
-        run: uv sync --frozen
+          python-version: "3.14"
 
       - name: Run SonarQube scan
         uses: SonarSource/sonarqube-scan-action@v8.2.0
@@ -240,10 +222,11 @@ jobs:
         with:
           args: >
             -Dsonar.projectKey=${{ vars.SONAR_PROJECT_KEY }}
+            -Dsonar.projectName="data-cosmos"
             -Dsonar.organization=${{ vars.SONAR_ORGANIZATION }}
-            -Dsonar.projectName="Data Cosmos"
-            -Dsonar.sources=backend,frontend,tests
-            -Dsonar.exclusions=**/__pycache__/**,**/.venv/**,**/.nicegui/**,**/data/**,**/dist/**,**/build/**,**/*.pyc
+            -Dsonar.sources="."
+            -Dsonar.exclusions="**/node_modules/**,**/dist/**,**/.venv/**,**/__pycache__/**,**/data/**"
+            -Dsonar.qualitygate.wait=true
 
       - name: Upload SonarQube artifact
         if: always()
