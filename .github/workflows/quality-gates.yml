@@ -1,0 +1,266 @@
+name: Quality Gates
+
+on:
+  push:
+    branches:
+      - development
+    paths:
+      - "backend/**"
+      - "frontend/**"
+      - "tests/**"
+      - "main.py"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "docker-compose.yml"
+      - ".github/workflows/quality-gates.yml"
+  pull_request:
+    branches:
+      - development
+    paths:
+      - "backend/**"
+      - "frontend/**"
+      - "tests/**"
+      - "main.py"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "docker-compose.yml"
+      - ".github/workflows/quality-gates.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read
+  security-events: write
+
+jobs:
+  quality-gates:
+    name: CI and Security Gates
+    runs-on: ubuntu-latest
+    env:
+      PYTHON_VERSION: "3.14"
+      PYTHONPATH: backend:frontend
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Cache pip downloads
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('pyproject.toml', 'uv.lock', 'backend/requirements.txt', 'frontend/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install -r backend/requirements.txt -r frontend/requirements.txt
+          python -m pip install pytest pytest-cov ruff
+
+      - name: Lint code
+        run: ruff check --select E9,F63,F7,F82 backend frontend main.py
+
+      - name: Secret scan (Gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run Trivy filesystem report scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,license
+          severity: LOW,MEDIUM,HIGH,CRITICAL
+          ignore-unfixed: false
+          format: sarif
+          output: trivy-fs-all.sarif
+          exit-code: 0
+
+      - name: Run Trivy filesystem blocking gate
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,license
+          severity: HIGH,CRITICAL
+          ignore-unfixed: false
+          format: sarif
+          output: trivy-fs-blocking.sarif
+          exit-code: 1
+
+      - name: Upload Trivy SARIF
+        if: always() && github.repository_visibility == 'public'
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-fs-all.sarif
+
+      - name: Upload Trivy artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-results
+          path: |
+            trivy-fs-all.sarif
+            trivy-fs-blocking.sarif
+          if-no-files-found: ignore
+
+      - name: Run Hadolint on backend Dockerfile
+        uses: hadolint/hadolint-action@v3.3.0
+        with:
+          dockerfile: backend/Dockerfile
+          failure-threshold: warning
+          format: sarif
+          output-file: backend-hadolint.sarif
+
+      - name: Upload backend Hadolint SARIF
+        if: always() && github.repository_visibility == 'public'
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: backend-hadolint.sarif
+
+      - name: Run Hadolint on frontend Dockerfile
+        uses: hadolint/hadolint-action@v3.3.0
+        with:
+          dockerfile: frontend/Dockerfile
+          failure-threshold: warning
+          format: sarif
+          output-file: frontend-hadolint.sarif
+
+      - name: Upload frontend Hadolint SARIF
+        if: always() && github.repository_visibility == 'public'
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: frontend-hadolint.sarif
+
+      - name: Upload Hadolint artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hadolint-results
+          path: |
+            backend-hadolint.sarif
+            frontend-hadolint.sarif
+          if-no-files-found: ignore
+
+      - name: Build backend image
+        run: docker build -f backend/Dockerfile -t data-cosmos-backend:${{ github.sha }} .
+
+      - name: Scan backend image with Grype
+        uses: anchore/scan-action@v7.4.0
+        with:
+          image: data-cosmos-backend:${{ github.sha }}
+          fail-build: false
+          output-format: sarif
+          output-file: backend-grype-all.sarif
+          severity-cutoff: negligible
+
+      - name: Run backend Grype blocking gate
+        uses: anchore/scan-action@v7.4.0
+        with:
+          image: data-cosmos-backend:${{ github.sha }}
+          fail-build: true
+          output-format: sarif
+          output-file: backend-grype-blocking.sarif
+          severity-cutoff: high
+
+      - name: Upload backend Grype SARIF
+        if: always() && github.repository_visibility == 'public'
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: backend-grype-all.sarif
+
+      - name: Build frontend image
+        run: docker build -f frontend/Dockerfile -t data-cosmos-frontend:${{ github.sha }} .
+
+      - name: Scan frontend image with Grype
+        uses: anchore/scan-action@v7.4.0
+        with:
+          image: data-cosmos-frontend:${{ github.sha }}
+          fail-build: false
+          output-format: sarif
+          output-file: frontend-grype-all.sarif
+          severity-cutoff: negligible
+
+      - name: Run frontend Grype blocking gate
+        uses: anchore/scan-action@v7.4.0
+        with:
+          image: data-cosmos-frontend:${{ github.sha }}
+          fail-build: true
+          output-format: sarif
+          output-file: frontend-grype-blocking.sarif
+          severity-cutoff: high
+
+      - name: Upload frontend Grype SARIF
+        if: always() && github.repository_visibility == 'public'
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: frontend-grype-all.sarif
+
+      - name: Upload Grype artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: grype-results
+          path: |
+            backend-grype-all.sarif
+            backend-grype-blocking.sarif
+            frontend-grype-all.sarif
+            frontend-grype-blocking.sarif
+          if-no-files-found: ignore
+
+      - name: Run tests with coverage
+        run: |
+          pytest tests/test_scripts \
+            --cov=backend/app \
+            --cov=frontend \
+            --cov-report=term-missing \
+            --cov-report=xml:coverage.xml \
+            --cov-fail-under=0
+        # WARNING: no prior measured coverage was available, so coverage enforcement is set to 0 until a baseline is established.
+
+      - name: Upload coverage artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-results
+          path: coverage.xml
+          if-no-files-found: ignore
+
+      - name: Run SonarQube scan
+        uses: SonarSource/sonarqube-scan-action@v8.2.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        with:
+          args: >
+            -Dsonar.projectKey=${{ vars.SONAR_PROJECT_KEY }}
+            -Dsonar.projectName="data-cosmos"
+            -Dsonar.organization=${{ vars.SONAR_ORGANIZATION }}
+            -Dsonar.qualitygate.wait=true
+            -Dsonar.sources=backend,frontend,main.py
+            -Dsonar.python.version=3.14
+            -Dsonar.python.coverage.reportPaths=coverage.xml
+            -Dsonar.exclusions=**/.venv/**,**/__pycache__/**,**/*.db,**/*.authbak,**/tests/samples/**
+
+      - name: Upload SonarQube artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sonarqube-results
+          path: |
+            .scannerwork/report-task.txt
+            .scannerwork/*.json
+            .scannerwork/*.txt
+          if-no-files-found: ignore
