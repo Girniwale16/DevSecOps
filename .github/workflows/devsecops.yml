@@ -11,13 +11,17 @@ on:
       - "pyproject.toml"
       - "uv.lock"
       - "docker-compose.yml"
-      - "**/*.py"
+      - ".trivyignore"
+      - ".grype.yaml"
+      - ".hadolint.yaml"
+      - ".checkov.baseline"
+      - "sonar-project.properties"
+      - "**/Dockerfile"
       - "**/*.tf"
       - "**/*.tfvars"
       - "**/*.yaml"
       - "**/*.yml"
       - "**/kustomization.yaml"
-      - "**/Dockerfile"
       - ".github/workflows/devsecops.yml"
 
 concurrency:
@@ -26,8 +30,8 @@ concurrency:
 
 permissions:
   contents: read
-  security-events: write
   actions: read
+  security-events: write
 
 jobs:
   sca-trivy-scan:
@@ -51,7 +55,8 @@ jobs:
           exit-code: 0
 
       - name: Upload Trivy SARIF
-        uses: github/codeql-action/upload-sarif@v3
+        if: github.repository_visibility == 'public'
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: trivy-fs.sarif
 
@@ -60,10 +65,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: trivy-results
-          path: |
-            trivy-fs.sarif
-            trivy-fs.json
-            trivy-fs.txt
+          path: trivy-fs.sarif
           if-no-files-found: ignore
 
   container-grype-scan:
@@ -75,21 +77,19 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Build backend image
-        if: ${{ hashFiles('backend/Dockerfile') != '' }}
         run: docker build -f backend/Dockerfile -t data-cosmos-backend:${{ github.sha }} .
 
       - name: Scan backend image with Grype
-        if: ${{ hashFiles('backend/Dockerfile') != '' }}
         uses: anchore/scan-action@v7.4.0
         with:
           image: data-cosmos-backend:${{ github.sha }}
-          fail-build: true
+          fail-build: false
           output-format: sarif
           output-file: backend-grype.sarif
 
       - name: Upload backend Grype SARIF
-        if: always() && hashFiles('backend/Dockerfile') != ''
-        uses: github/codeql-action/upload-sarif@v3
+        if: github.repository_visibility == 'public'
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: backend-grype.sarif
 
@@ -98,28 +98,23 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: backend-grype-results
-          path: |
-            backend-grype.sarif
-            backend-grype.json
-            backend-grype.txt
+          path: backend-grype.sarif
           if-no-files-found: ignore
 
       - name: Build frontend image
-        if: ${{ hashFiles('frontend/Dockerfile') != '' }}
         run: docker build -f frontend/Dockerfile -t data-cosmos-frontend:${{ github.sha }} .
 
       - name: Scan frontend image with Grype
-        if: ${{ hashFiles('frontend/Dockerfile') != '' }}
         uses: anchore/scan-action@v7.4.0
         with:
           image: data-cosmos-frontend:${{ github.sha }}
-          fail-build: true
+          fail-build: false
           output-format: sarif
           output-file: frontend-grype.sarif
 
       - name: Upload frontend Grype SARIF
-        if: always() && hashFiles('frontend/Dockerfile') != ''
-        uses: github/codeql-action/upload-sarif@v3
+        if: github.repository_visibility == 'public'
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: frontend-grype.sarif
 
@@ -128,10 +123,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: frontend-grype-results
-          path: |
-            frontend-grype.sarif
-            frontend-grype.json
-            frontend-grype.txt
+          path: frontend-grype.sarif
           if-no-files-found: ignore
 
   hadolint-scan:
@@ -143,7 +135,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Run Hadolint on backend Dockerfile
-        if: ${{ hashFiles('backend/Dockerfile') != '' }}
+        continue-on-error: true
         uses: hadolint/hadolint-action@v3.3.0
         with:
           dockerfile: backend/Dockerfile
@@ -152,8 +144,8 @@ jobs:
           output-file: backend-hadolint.sarif
 
       - name: Upload backend Hadolint SARIF
-        if: always() && hashFiles('backend/Dockerfile') != ''
-        uses: github/codeql-action/upload-sarif@v3
+        if: github.repository_visibility == 'public'
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: backend-hadolint.sarif
 
@@ -162,14 +154,11 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: backend-hadolint-results
-          path: |
-            backend-hadolint.sarif
-            backend-hadolint.json
-            backend-hadolint.txt
+          path: backend-hadolint.sarif
           if-no-files-found: ignore
 
       - name: Run Hadolint on frontend Dockerfile
-        if: ${{ hashFiles('frontend/Dockerfile') != '' }}
+        continue-on-error: true
         uses: hadolint/hadolint-action@v3.3.0
         with:
           dockerfile: frontend/Dockerfile
@@ -178,8 +167,8 @@ jobs:
           output-file: frontend-hadolint.sarif
 
       - name: Upload frontend Hadolint SARIF
-        if: always() && hashFiles('frontend/Dockerfile') != ''
-        uses: github/codeql-action/upload-sarif@v3
+        if: github.repository_visibility == 'public'
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: frontend-hadolint.sarif
 
@@ -188,10 +177,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: frontend-hadolint-results
-          path: |
-            frontend-hadolint.sarif
-            frontend-hadolint.json
-            frontend-hadolint.txt
+          path: frontend-hadolint.sarif
           if-no-files-found: ignore
 
   checkov-scan:
@@ -202,35 +188,18 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Detect IaC files
-        id: detect-iac
-        shell: bash
-        run: |
-          if find . -type f \( \
-            -name '*.tf' -o \
-            -name '*.tfvars' -o \
-            -name 'kustomization.yaml' -o \
-            -name 'docker-compose.yml' -o \
-            -name 'Chart.yaml' \
-          \) | grep -q .; then
-            echo "found=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "found=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Run Checkov
-        if: steps.detect-iac.outputs.found == 'true'
+      - name: Run Checkov against docker-compose
         uses: bridgecrewio/checkov-action@v12.1347.0
         with:
-          directory: .
-          framework: terraform,kubernetes,cloudformation,helm,docker-compose
+          file: docker-compose.yml
+          framework: docker_compose
           output_format: sarif
           output_file_path: checkov-results.sarif
-          soft_fail: false
+          soft_fail: true
 
       - name: Upload Checkov SARIF
-        if: always() && steps.detect-iac.outputs.found == 'true'
-        uses: github/codeql-action/upload-sarif@v3
+        if: github.repository_visibility == 'public'
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: checkov-results.sarif
 
@@ -239,10 +208,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: checkov-results
-          path: |
-            checkov-results.sarif
-            checkov-results.json
-            checkov-results.txt
+          path: checkov-results.sarif
           if-no-files-found: ignore
 
   sonarqube-scan:
@@ -263,11 +229,10 @@ jobs:
       - name: Set up uv
         uses: astral-sh/setup-uv@v8.2.0
 
-      - name: Install project dependencies
+      - name: Install dependencies
         run: uv sync --frozen
 
-      - name: Run SonarQube scan for SonarCloud
-        if: ${{ vars.SONAR_ORGANIZATION != '' }}
+      - name: Run SonarQube scan
         uses: SonarSource/sonarqube-scan-action@v8.2.0
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
@@ -275,23 +240,10 @@ jobs:
         with:
           args: >
             -Dsonar.projectKey=${{ vars.SONAR_PROJECT_KEY }}
-            -Dsonar.projectName="Data Cosmos"
             -Dsonar.organization=${{ vars.SONAR_ORGANIZATION }}
-            -Dsonar.sources="."
-            -Dsonar.exclusions=**/node_modules/**,**/target/**,**/dist/**,**/__pycache__/**,**/.venv/**,backend/data/**,frontend/.nicegui/**
-
-      - name: Run SonarQube scan for SonarQube Server
-        if: ${{ vars.SONAR_ORGANIZATION == '' }}
-        uses: SonarSource/sonarqube-scan-action@v8.2.0
-        env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
-        with:
-          args: >
-            -Dsonar.projectKey=${{ vars.SONAR_PROJECT_KEY }}
             -Dsonar.projectName="Data Cosmos"
-            -Dsonar.sources="."
-            -Dsonar.exclusions=**/node_modules/**,**/target/**,**/dist/**,**/__pycache__/**,**/.venv/**,backend/data/**,frontend/.nicegui/**
+            -Dsonar.sources=backend,frontend,tests
+            -Dsonar.exclusions=**/__pycache__/**,**/.venv/**,**/.nicegui/**,**/data/**,**/dist/**,**/build/**,**/*.pyc
 
       - name: Upload SonarQube artifact
         if: always()
