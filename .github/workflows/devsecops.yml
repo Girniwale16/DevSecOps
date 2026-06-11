@@ -16,6 +16,7 @@ on:
       - "backend/Dockerfile"
       - "frontend/Dockerfile"
       - "docker-compose.yml"
+      - ".github/workflows/devsecops.yml"
 
 permissions:
   contents: read
