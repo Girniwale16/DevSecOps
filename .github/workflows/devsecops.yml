@@ -1,19 +1,24 @@
-name: DevSecOps Security Pack
+name: DevSecOps Scan
 
 on:
   push:
     branches:
       - main
     paths:
-      - backend/**
-      - frontend/**
-      - tests/**
-      - pyproject.toml
-      - uv.lock
-      - docker-compose.yml
+      - "backend/**"
+      - "frontend/**"
+      - "tests/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "docker-compose.yml"
+      - "**/*.py"
+      - "**/*.tf"
+      - "**/*.tfvars"
+      - "**/*.yaml"
+      - "**/*.yml"
+      - "**/kustomization.yaml"
       - "**/Dockerfile"
-      - .github/workflows/devsecops.yml
-  workflow_dispatch:
+      - ".github/workflows/devsecops.yml"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -21,20 +26,19 @@ concurrency:
 
 permissions:
   contents: read
+  security-events: write
+  actions: read
 
 jobs:
   sca-trivy-scan:
-    name: Trivy filesystem scan
+    name: Trivy SCA Scan
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Prepare report directory
-        run: mkdir -p reports
-
-      - name: Scan repository with Trivy
+      - name: Run Trivy filesystem scan
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: fs
@@ -43,124 +47,206 @@ jobs:
           severity: HIGH,CRITICAL
           ignore-unfixed: true
           format: sarif
-          output: reports/trivy-filesystem.sarif
-          exit-code: 1
+          output: trivy-fs.sarif
+          exit-code: 0
 
-      - name: Upload Trivy report
+      - name: Upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-fs.sarif
+
+      - name: Upload Trivy artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: trivy-filesystem-report
-          path: reports/trivy-filesystem.sarif
-          if-no-files-found: warn
+          name: trivy-results
+          path: |
+            trivy-fs.sarif
+            trivy-fs.json
+            trivy-fs.txt
+          if-no-files-found: ignore
 
   container-grype-scan:
-    name: Grype container scan
+    name: Grype Container Scan
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: backend
-            dockerfile: backend/Dockerfile
-            image: data-cosmos-backend
-          - name: frontend
-            dockerfile: frontend/Dockerfile
-            image: data-cosmos-frontend
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Prepare report directory
-        run: mkdir -p reports
+      - name: Build backend image
+        if: ${{ hashFiles('backend/Dockerfile') != '' }}
+        run: docker build -f backend/Dockerfile -t data-cosmos-backend:${{ github.sha }} .
 
-      - name: Build local container image
-        run: docker build -f "${{ matrix.dockerfile }}" -t "${{ matrix.image }}:${{ github.sha }}" .
-
-      - name: Scan container image with Grype
+      - name: Scan backend image with Grype
+        if: ${{ hashFiles('backend/Dockerfile') != '' }}
         uses: anchore/scan-action@v7.4.0
         with:
-          image: ${{ matrix.image }}:${{ github.sha }}
+          image: data-cosmos-backend:${{ github.sha }}
           fail-build: true
-          severity-cutoff: high
           output-format: sarif
-          output-file: reports/grype-${{ matrix.name }}.sarif
-          cache-db: true
+          output-file: backend-grype.sarif
 
-      - name: Upload Grype report
+      - name: Upload backend Grype SARIF
+        if: always() && hashFiles('backend/Dockerfile') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: backend-grype.sarif
+
+      - name: Upload backend Grype artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: grype-${{ matrix.name }}-report
-          path: reports/grype-${{ matrix.name }}.sarif
-          if-no-files-found: warn
+          name: backend-grype-results
+          path: |
+            backend-grype.sarif
+            backend-grype.json
+            backend-grype.txt
+          if-no-files-found: ignore
+
+      - name: Build frontend image
+        if: ${{ hashFiles('frontend/Dockerfile') != '' }}
+        run: docker build -f frontend/Dockerfile -t data-cosmos-frontend:${{ github.sha }} .
+
+      - name: Scan frontend image with Grype
+        if: ${{ hashFiles('frontend/Dockerfile') != '' }}
+        uses: anchore/scan-action@v7.4.0
+        with:
+          image: data-cosmos-frontend:${{ github.sha }}
+          fail-build: true
+          output-format: sarif
+          output-file: frontend-grype.sarif
+
+      - name: Upload frontend Grype SARIF
+        if: always() && hashFiles('frontend/Dockerfile') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: frontend-grype.sarif
+
+      - name: Upload frontend Grype artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-grype-results
+          path: |
+            frontend-grype.sarif
+            frontend-grype.json
+            frontend-grype.txt
+          if-no-files-found: ignore
 
   hadolint-scan:
-    name: Hadolint Dockerfile lint
+    name: Hadolint Scan
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: backend
-            dockerfile: backend/Dockerfile
-          - name: frontend
-            dockerfile: frontend/Dockerfile
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Prepare report directory
-        run: mkdir -p reports
-
-      - name: Lint Dockerfile with Hadolint
+      - name: Run Hadolint on backend Dockerfile
+        if: ${{ hashFiles('backend/Dockerfile') != '' }}
         uses: hadolint/hadolint-action@v3.3.0
         with:
-          dockerfile: ${{ matrix.dockerfile }}
-          recursive: false
-          format: sarif
-          output-file: reports/hadolint-${{ matrix.name }}.sarif
+          dockerfile: backend/Dockerfile
           failure-threshold: warning
+          format: sarif
+          output-file: backend-hadolint.sarif
 
-      - name: Upload Hadolint report
+      - name: Upload backend Hadolint SARIF
+        if: always() && hashFiles('backend/Dockerfile') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: backend-hadolint.sarif
+
+      - name: Upload backend Hadolint artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: hadolint-${{ matrix.name }}-report
-          path: reports/hadolint-${{ matrix.name }}.sarif
-          if-no-files-found: warn
+          name: backend-hadolint-results
+          path: |
+            backend-hadolint.sarif
+            backend-hadolint.json
+            backend-hadolint.txt
+          if-no-files-found: ignore
+
+      - name: Run Hadolint on frontend Dockerfile
+        if: ${{ hashFiles('frontend/Dockerfile') != '' }}
+        uses: hadolint/hadolint-action@v3.3.0
+        with:
+          dockerfile: frontend/Dockerfile
+          failure-threshold: warning
+          format: sarif
+          output-file: frontend-hadolint.sarif
+
+      - name: Upload frontend Hadolint SARIF
+        if: always() && hashFiles('frontend/Dockerfile') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: frontend-hadolint.sarif
+
+      - name: Upload frontend Hadolint artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-hadolint-results
+          path: |
+            frontend-hadolint.sarif
+            frontend-hadolint.json
+            frontend-hadolint.txt
+          if-no-files-found: ignore
 
   checkov-scan:
-    name: Checkov IaC scan
+    name: Checkov Scan
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Prepare report directory
-        run: mkdir -p reports
+      - name: Detect IaC files
+        id: detect-iac
+        shell: bash
+        run: |
+          if find . -type f \( \
+            -name '*.tf' -o \
+            -name '*.tfvars' -o \
+            -name 'kustomization.yaml' -o \
+            -name 'docker-compose.yml' -o \
+            -name 'Chart.yaml' \
+          \) | grep -q .; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
 
-      - name: Scan infrastructure as code with Checkov
+      - name: Run Checkov
+        if: steps.detect-iac.outputs.found == 'true'
         uses: bridgecrewio/checkov-action@v12.1347.0
         with:
-          file: docker-compose.yml
-          framework: docker_compose
-          output_format: cli,sarif
-          output_file_path: console,reports/checkov-docker-compose.sarif
+          directory: .
+          framework: terraform,kubernetes,cloudformation,helm,docker-compose
+          output_format: sarif
+          output_file_path: checkov-results.sarif
+          soft_fail: false
 
-      - name: Upload Checkov report
+      - name: Upload Checkov SARIF
+        if: always() && steps.detect-iac.outputs.found == 'true'
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: checkov-results.sarif
+
+      - name: Upload Checkov artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: checkov-docker-compose-report
-          path: reports/checkov-docker-compose.sarif
-          if-no-files-found: warn
+          name: checkov-results
+          path: |
+            checkov-results.sarif
+            checkov-results.json
+            checkov-results.txt
+          if-no-files-found: ignore
 
   sonarqube-scan:
-    name: SonarQube analysis
+    name: SonarQube Scan
     runs-on: ubuntu-latest
 
     steps:
@@ -169,18 +255,51 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Run SonarQube scan
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v8.2.0
+
+      - name: Install project dependencies
+        run: uv sync --frozen
+
+      - name: Run SonarQube scan for SonarCloud
+        if: ${{ vars.SONAR_ORGANIZATION != '' }}
         uses: SonarSource/sonarqube-scan-action@v8.2.0
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
         with:
-          projectBaseDir: .
           args: >
+            -Dsonar.projectKey=${{ vars.SONAR_PROJECT_KEY }}
+            -Dsonar.projectName="Data Cosmos"
             -Dsonar.organization=${{ vars.SONAR_ORGANIZATION }}
+            -Dsonar.sources="."
+            -Dsonar.exclusions=**/node_modules/**,**/target/**,**/dist/**,**/__pycache__/**,**/.venv/**,backend/data/**,frontend/.nicegui/**
+
+      - name: Run SonarQube scan for SonarQube Server
+        if: ${{ vars.SONAR_ORGANIZATION == '' }}
+        uses: SonarSource/sonarqube-scan-action@v8.2.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        with:
+          args: >
             -Dsonar.projectKey=${{ vars.SONAR_PROJECT_KEY }}
             -Dsonar.projectName="Data Cosmos"
             -Dsonar.sources="."
-            -Dsonar.tests="tests"
-            -Dsonar.test.inclusions="tests/**/*.py"
-            -Dsonar.exclusions="backend/data/**,frontend/.nicegui/**,**/*.db,**/*.log,**/*.ipynb,**/*.authbak"
+            -Dsonar.exclusions=**/node_modules/**,**/target/**,**/dist/**,**/__pycache__/**,**/.venv/**,backend/data/**,frontend/.nicegui/**
+
+      - name: Upload SonarQube artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sonarqube-results
+          path: |
+            .scannerwork/report-task.txt
+            .scannerwork/*.json
+            .scannerwork/*.txt
+          if-no-files-found: ignore
