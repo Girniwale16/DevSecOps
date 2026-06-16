@@ -311,7 +311,10 @@ jobs:
         continue-on-error: true
         run: |
           pytest tests --cov=backend --cov=frontend --cov-report=xml:coverage.xml --cov-fail-under=0
-
+      - name: Debug Sonar variables
+        run: |
+          echo "PROJECT_KEY=${{ vars.SONAR_PROJECT_KEY }}"
+          echo "ORG=${{ vars.SONAR_ORGANIZATION }}"
       - name: Run SonarQube scan
         uses: SonarSource/sonarqube-scan-action@v8.2.0
         with:
