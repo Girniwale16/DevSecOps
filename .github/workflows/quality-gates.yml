@@ -7,7 +7,6 @@ on:
     paths:
       - "backend/**"
       - "frontend/**"
-      - "tests/**"
       - "pyproject.toml"
       - "uv.lock"
       - "docker-compose.yml"
@@ -18,7 +17,6 @@ on:
     paths:
       - "backend/**"
       - "frontend/**"
-      - "tests/**"
       - "pyproject.toml"
       - "uv.lock"
       - "docker-compose.yml"
@@ -30,15 +28,13 @@ concurrency:
 
 permissions:
   contents: read
-  security-events: write
   actions: read
+  security-events: write
 
 jobs:
   ci-base:
     name: CI Base
     runs-on: ubuntu-latest
-    env:
-      PYTHONPATH: ${{ github.workspace }}/backend
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6.0.3
@@ -48,26 +44,32 @@ jobs:
         with:
           python-version: "3.14"
 
-      - name: Cache pip
+      - name: Cache pip downloads
         uses: actions/cache@v5.0.5
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('pyproject.toml', 'backend/requirements.txt', 'frontend/requirements.txt') }}
+          key: ${{ runner.os }}-pip-${{ hashFiles('backend/requirements.txt', 'frontend/requirements.txt', 'pyproject.toml', 'uv.lock') }}
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r backend/requirements.txt -r frontend/requirements.txt pytest pytest-cov ruff
+          python -m pip install -r backend/requirements.txt -r frontend/requirements.txt pytest pytest-cov ruff
 
       - name: Lint with Ruff
         continue-on-error: true
         run: |
-          ruff check backend frontend tests main.py --output-format json > ruff-report.json
+          ruff check backend frontend --output-format json --output-file ruff-report.json
 
       - name: Test with coverage
         continue-on-error: true
         run: |
-          pytest tests --cov=backend --cov=frontend --cov-report=xml:coverage.xml --cov-report=term --cov-fail-under=0
+          # WARNING: no repository test suite was auto-detected; threshold enforcement remains disabled at 0%.
+          set -o pipefail
+          pytest backend frontend \
+            --cov=backend \
+            --cov=frontend \
+            --cov-report=term \
+            --cov-report=xml:coverage.xml | tee pytest-report.txt
 
       - name: Upload CI artifacts
         if: always()
@@ -76,15 +78,16 @@ jobs:
           name: ci-results
           path: |
             ruff-report.json
+            pytest-report.txt
             coverage.xml
           if-no-files-found: ignore
 
   osv-scan:
-    name: OSV Scanner
+    name: OSV Scan
     needs: ci-base
     uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@v2.3.8
     with:
-      scan-args: |
+      scan-args: |-
         --recursive
         ./
 
@@ -102,7 +105,6 @@ jobs:
         uses: gitleaks/gitleaks-action@v3.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "true"
 
   sca-trivy-scan:
     name: Trivy SCA Scan
@@ -141,9 +143,8 @@ jobs:
         uses: github/codeql-action/upload-sarif@v4.33.0
         with:
           sarif_file: trivy-fs-all.sarif
-          category: trivy-fs
 
-      - name: Upload Trivy artifact
+      - name: Upload Trivy artifacts
         if: always()
         uses: actions/upload-artifact@v7.0.1
         with:
@@ -162,11 +163,9 @@ jobs:
         uses: actions/checkout@v6.0.3
 
       - name: Build backend image
-        if: ${{ hashFiles('backend/Dockerfile') != '' }}
         run: docker build -f backend/Dockerfile -t data-cosmos-backend:${{ github.sha }} .
 
-      - name: Scan backend image with Grype report
-        if: ${{ hashFiles('backend/Dockerfile') != '' }}
+      - name: Run backend Grype report scan
         uses: anchore/scan-action@v7.4.0
         with:
           image: data-cosmos-backend:${{ github.sha }}
@@ -174,8 +173,7 @@ jobs:
           output-format: sarif
           output-file: backend-grype.sarif
 
-      - name: Scan backend image with Grype blocking gate
-        if: ${{ hashFiles('backend/Dockerfile') != '' }}
+      - name: Run backend Grype blocking gate
         uses: anchore/scan-action@v7.4.0
         with:
           image: data-cosmos-backend:${{ github.sha }}
@@ -185,18 +183,26 @@ jobs:
           output-file: backend-grype-blocking.sarif
 
       - name: Upload backend Grype SARIF
-        if: ${{ hashFiles('backend/Dockerfile') != '' }} && github.repository_visibility == 'public'
+        if: always() && github.repository_visibility == 'public'
         uses: github/codeql-action/upload-sarif@v4.33.0
         with:
           sarif_file: backend-grype.sarif
           category: grype-backend
 
+      - name: Upload backend Grype artifacts
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: backend-grype-results
+          path: |
+            backend-grype.sarif
+            backend-grype-blocking.sarif
+          if-no-files-found: ignore
+
       - name: Build frontend image
-        if: ${{ hashFiles('frontend/Dockerfile') != '' }}
         run: docker build -f frontend/Dockerfile -t data-cosmos-frontend:${{ github.sha }} .
 
-      - name: Scan frontend image with Grype report
-        if: ${{ hashFiles('frontend/Dockerfile') != '' }}
+      - name: Run frontend Grype report scan
         uses: anchore/scan-action@v7.4.0
         with:
           image: data-cosmos-frontend:${{ github.sha }}
@@ -204,8 +210,7 @@ jobs:
           output-format: sarif
           output-file: frontend-grype.sarif
 
-      - name: Scan frontend image with Grype blocking gate
-        if: ${{ hashFiles('frontend/Dockerfile') != '' }}
+      - name: Run frontend Grype blocking gate
         uses: anchore/scan-action@v7.4.0
         with:
           image: data-cosmos-frontend:${{ github.sha }}
@@ -215,20 +220,18 @@ jobs:
           output-file: frontend-grype-blocking.sarif
 
       - name: Upload frontend Grype SARIF
-        if: ${{ hashFiles('frontend/Dockerfile') != '' }} && github.repository_visibility == 'public'
+        if: always() && github.repository_visibility == 'public'
         uses: github/codeql-action/upload-sarif@v4.33.0
         with:
           sarif_file: frontend-grype.sarif
           category: grype-frontend
 
-      - name: Upload Grype artifact
+      - name: Upload frontend Grype artifacts
         if: always()
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: grype-results
+          name: frontend-grype-results
           path: |
-            backend-grype.sarif
-            backend-grype-blocking.sarif
             frontend-grype.sarif
             frontend-grype-blocking.sarif
           if-no-files-found: ignore
@@ -242,7 +245,6 @@ jobs:
         uses: actions/checkout@v6.0.3
 
       - name: Run Hadolint on backend Dockerfile
-        if: ${{ hashFiles('backend/Dockerfile') != '' }}
         uses: hadolint/hadolint-action@v3.3.0
         with:
           dockerfile: backend/Dockerfile
@@ -251,14 +253,21 @@ jobs:
           output-file: backend-hadolint.sarif
 
       - name: Upload backend Hadolint SARIF
-        if: ${{ hashFiles('backend/Dockerfile') != '' }} && github.repository_visibility == 'public'
+        if: always() && github.repository_visibility == 'public'
         uses: github/codeql-action/upload-sarif@v4.33.0
         with:
           sarif_file: backend-hadolint.sarif
           category: hadolint-backend
 
+      - name: Upload backend Hadolint artifact
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: backend-hadolint-results
+          path: backend-hadolint.sarif
+          if-no-files-found: ignore
+
       - name: Run Hadolint on frontend Dockerfile
-        if: ${{ hashFiles('frontend/Dockerfile') != '' }}
         uses: hadolint/hadolint-action@v3.3.0
         with:
           dockerfile: frontend/Dockerfile
@@ -267,30 +276,24 @@ jobs:
           output-file: frontend-hadolint.sarif
 
       - name: Upload frontend Hadolint SARIF
-        if: ${{ hashFiles('frontend/Dockerfile') != '' }} && github.repository_visibility == 'public'
+        if: always() && github.repository_visibility == 'public'
         uses: github/codeql-action/upload-sarif@v4.33.0
         with:
           sarif_file: frontend-hadolint.sarif
           category: hadolint-frontend
 
-      - name: Upload Hadolint artifact
+      - name: Upload frontend Hadolint artifact
         if: always()
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: hadolint-results
-          path: |
-            backend-hadolint.sarif
-            frontend-hadolint.sarif
+          name: frontend-hadolint-results
+          path: frontend-hadolint.sarif
           if-no-files-found: ignore
 
   sonarqube-scan:
     name: SonarQube Cloud Scan
     needs: ci-base
     runs-on: ubuntu-latest
-    env:
-      PYTHONPATH: ${{ github.workspace }}/backend
-      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-      SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6.0.3
@@ -317,19 +320,18 @@ jobs:
           echo "ORG=${{ vars.SONAR_ORGANIZATION }}"
       - name: Run SonarQube scan
         uses: SonarSource/sonarqube-scan-action@v8.2.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         with:
           args: >
             -Dsonar.projectKey=${{ vars.SONAR_PROJECT_KEY }}
-            -Dsonar.projectName="data-cosmos"
             -Dsonar.organization=${{ vars.SONAR_ORGANIZATION }}
+            -Dsonar.projectName="data-cosmos"
             -Dsonar.qualitygate.wait=true
-            -Dsonar.sources=backend,frontend
-            -Dsonar.tests=tests
-            -Dsonar.python.version=3.14
-            -Dsonar.python.coverage.reportPaths=coverage.xml
-            -Dsonar.exclusions=**/*.ipynb,**/*.db,**/.venv/**,**/node_modules/**
+            -Dsonar.sources=backend/app,frontend
+            -Dsonar.exclusions=backend/data/**,**/*.authbak,**/*.db,**/*.csv,**/*.zip,**/*.log
 
-      - name: Upload SonarQube artifact
+      - name: Upload SonarQube artifacts
         if: always()
         uses: actions/upload-artifact@v7.0.1
         with:
@@ -338,5 +340,4 @@ jobs:
             .scannerwork/report-task.txt
             .scannerwork/*.json
             .scannerwork/*.txt
-            coverage.xml
           if-no-files-found: ignore
