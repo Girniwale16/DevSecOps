@@ -102,6 +102,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6.0.3
+        with:
+         fetch-depth: 0
 
       - name: Secret scan
         uses: gitleaks/gitleaks-action@v3.0.0
